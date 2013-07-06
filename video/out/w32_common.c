@@ -35,6 +35,25 @@
 
 #define WIN_ID_TO_HWND(x) ((HWND)(intptr_t)(x))
 
+#ifndef WM_DPICHANGED
+#define WM_DPICHANGED 0x02E0
+#endif
+
+#ifndef DPI_ENUMS_DECLARED
+typedef enum PROCESS_DPI_AWARENESS {
+    PROCESS_DPI_UNAWARE = 0,
+    PROCESS_SYSTEM_DPI_AWARE = 1,
+    PROCESS_PER_MONITOR_DPI_AWARE = 2
+} PROCESS_DPI_AWARENESS;
+#endif
+
+#ifndef LOAD_LIBRARY_SEARCH_SYSTEM32
+#define LOAD_LIBRARY_SEARCH_SYSTEM32 0x0800
+#endif
+
+static HRESULT (WINAPI *pGetProcessDpiAwareness)
+    (HANDLE, PROCESS_DPI_AWARENESS*);
+
 static const wchar_t classname[] = L"mpv";
 
 static const struct mp_keymap vk_map[] = {
@@ -170,6 +189,29 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
                 return TRUE;
             }
             break;
+        case WM_DPICHANGED: {
+            // The video window is now mostly on a screen with a different DPI
+            // setting. Since mpv is pretty much resolution independent, the
+            // only thing to do is to resize the window. Windows provides the
+            // correct size in lParam.
+            RECT* new_size = (RECT*)lParam;
+
+            // If mpv isn't a DPI aware process for some reason, skip this
+            if (!pGetProcessDpiAwareness)
+                break;
+
+            PROCESS_DPI_AWARENESS dpa = PROCESS_DPI_UNAWARE;
+            pGetProcessDpiAwareness(NULL, &dpa);
+            if (dpa != PROCESS_PER_MONITOR_DPI_AWARE)
+                break;
+
+            SetWindowPos(hWnd, 0,
+                new_size->left, new_size->top,
+                new_size->right - new_size->left,
+                new_size->bottom - new_size->top,
+                SWP_NOZORDER | SWP_NOACTIVATE);
+            return 0;
+        }
         case WM_CLOSE:
             mp_input_put_key(vo->input_ctx, MP_KEY_CLOSE_WIN);
             break;
@@ -576,6 +618,16 @@ int vo_w32_config(struct vo *vo, uint32_t width, uint32_t height,
 int vo_w32_init(struct vo *vo)
 {
     assert(!vo->w32);
+
+    if (!pGetProcessDpiAwareness) {
+        HMODULE shcore = LoadLibraryExW(L"shcore.dll", NULL,
+                                        LOAD_LIBRARY_SEARCH_SYSTEM32);
+
+        if (shcore)
+            pGetProcessDpiAwareness =
+                (HRESULT (WINAPI*)(HANDLE, PROCESS_DPI_AWARENESS*))
+                GetProcAddress(shcore, "GetProcessDpiAwareness");
+    }
 
     struct vo_w32_state *w32 = talloc_zero(vo, struct vo_w32_state);
     vo->w32 = w32;
