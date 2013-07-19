@@ -197,10 +197,6 @@ Available video output drivers are:
             3
                 use ``D3DPOOL_SYSTEMMEM``, but without shadow texture
 
-    ``swap-discard``
-        Use ``D3DSWAPEFFECT_DISCARD``, which might be faster.
-        Might be slower too, as it must(?) clear every frame.
-
     ``exact-backbuffer``
         Always resize the backbuffer to window size.
 

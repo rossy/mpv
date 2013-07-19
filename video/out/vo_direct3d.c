@@ -122,7 +122,6 @@ typedef struct d3d_priv {
     // debugging
     int opt_force_power_of_2;
     int opt_texture_memory;
-    int opt_swap_discard;
     int opt_exact_backbuffer;
 
     struct vo *vo;
@@ -681,8 +680,7 @@ static void fill_d3d_presentparams(d3d_priv *priv,
     /* Prepare Direct3D initialization parameters. */
     memset(present_params, 0, sizeof(D3DPRESENT_PARAMETERS));
     present_params->Windowed               = TRUE;
-    present_params->SwapEffect             =
-        priv->opt_swap_discard ? D3DSWAPEFFECT_DISCARD : D3DSWAPEFFECT_COPY;
+    present_params->SwapEffect             = D3DSWAPEFFECT_DISCARD;
     present_params->Flags                  = D3DPRESENTFLAG_VIDEO;
     present_params->hDeviceWindow          = priv->vo->w32->window;
     present_params->BackBufferWidth        = priv->cur_backbuf_width;
@@ -1187,9 +1185,6 @@ const char *options_help_text = "-vo direct3d command line help:\n"
 "           1 use D3DPOOL_MANAGED\n"
 "           2 use D3DPOOL_DEFAULT\n"
 "           3 use D3DPOOL_SYSTEMMEM, but without shadow texture\n"
-"    swap-discard\n"
-"        Use D3DSWAPEFFECT_DISCARD, which might be faster.\n"
-"        Might be slower too, as it must (?) clear every frame.\n"
 "    exact-backbuffer\n"
 "        Always resize the backbuffer to window size.\n"
 "";
@@ -1234,7 +1229,6 @@ static int preinit_internal(struct vo *vo, const char *arg, bool allow_shaders)
         {"force-power-of-2", OPT_ARG_BOOL, &priv->opt_force_power_of_2},
         {"disable-texture-align", OPT_ARG_BOOL, &priv->opt_disable_texture_align},
         {"texture-memory", OPT_ARG_INT, &priv->opt_texture_memory},
-        {"swap-discard", OPT_ARG_BOOL, &priv->opt_swap_discard},
         {"exact-backbuffer", OPT_ARG_BOOL, &priv->opt_exact_backbuffer},
         {NULL}
     };
