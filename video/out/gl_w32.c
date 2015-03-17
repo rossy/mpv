@@ -30,6 +30,42 @@ struct w32_context {
     int flags;
 };
 
+static int choose_pixel_format(HDC dc, PIXELFORMATDESCRIPTOR *pfd)
+{
+    int pf;
+
+    // Try a pixel format that's compatible with desktop composition first.
+    // This should improve performance, and has been reported to reduce dropped
+    // frames when playing video at the same refresh rate as the monitor.
+    *pfd = (PIXELFORMATDESCRIPTOR) {
+        .nSize = sizeof(PIXELFORMATDESCRIPTOR),
+        .nVersion = 1,
+        .dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER |
+                   PFD_SUPPORT_COMPOSITION,
+        .iPixelType = PFD_TYPE_RGBA,
+        .cColorBits = 32,
+        .cAlphaBits = 8,
+        .iLayerType = PFD_MAIN_PLANE,
+    };
+    if ((pf = ChoosePixelFormat(dc, pfd)))
+        return pf;
+
+    // If the above format didn't work, fall back to a generic pixel format
+    // that doesn't support desktop composition
+    *pfd = (PIXELFORMATDESCRIPTOR) {
+        .nSize = sizeof(PIXELFORMATDESCRIPTOR),
+        .nVersion = 1,
+        .dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER,
+        .iPixelType = PFD_TYPE_RGBA,
+        .cColorBits = 24,
+        .iLayerType = PFD_MAIN_PLANE,
+    };
+    if ((pf = ChoosePixelFormat(dc, pfd)))
+        return pf;
+
+    return 0;
+}
+
 static bool create_dc(struct MPGLContext *ctx, int flags)
 {
     struct w32_context *w32_ctx = ctx->priv;
@@ -43,16 +79,7 @@ static bool create_dc(struct MPGLContext *ctx, int flags)
         return false;
 
     PIXELFORMATDESCRIPTOR pfd;
-    memset(&pfd, 0, sizeof pfd);
-    pfd.nSize = sizeof pfd;
-    pfd.nVersion = 1;
-    pfd.dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
-
-    pfd.iPixelType = PFD_TYPE_RGBA;
-    pfd.cColorBits = 24;
-    pfd.iLayerType = PFD_MAIN_PLANE;
-    int pf = ChoosePixelFormat(hdc, &pfd);
-
+    int pf = choose_pixel_format(hdc, &pfd);
     if (!pf) {
         MP_ERR(ctx->vo, "unable to select a valid pixel format!\n");
         ReleaseDC(win, hdc);
