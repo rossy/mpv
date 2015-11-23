@@ -95,6 +95,9 @@ struct vo_w32_state {
     BOOL tracking;
     TRACKMOUSEEVENT trackEvent;
 
+    // Is the window being dragged by its client area
+    bool client_area_dragging;
+
     int mouse_x;
     int mouse_y;
 
@@ -659,6 +662,24 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
     case WM_PAINT:
         signal_events(w32, VO_EVENT_EXPOSE);
         break;
+    case WM_WINDOWPOSCHANGING:
+        // Prevent the window from being dragged out of fullscreen, which can
+        // happen if the user double-clicks to enter fullscreen, but keeps the
+        // button held down and drags the window
+        if (w32->current_fs && w32->client_area_dragging) {
+            *((WINDOWPOS*)lParam) = (WINDOWPOS){
+                .hwnd = hWnd,
+                .hwndInsertAfter = 0,
+                .x = w32->screenrc.x0,
+                .y = w32->screenrc.y0,
+                .cx = w32->screenrc.x1,
+                .cy = w32->screenrc.y1,
+                .flags = 0
+            };
+
+            return 0;
+        }
+        break;
     case WM_MOVE: {
         POINT p = {0};
         ClientToScreen(w32->window, &p);
@@ -848,7 +869,9 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
             {
                 // Window dragging hack
                 ReleaseCapture();
+                w32->client_area_dragging = true;
                 SendMessage(hWnd, WM_NCLBUTTONDOWN, HTCAPTION, 0);
+                w32->client_area_dragging = false;
                 mp_input_put_key(w32->input_ctx, MP_MOUSE_BTN0 |
                                                  MP_KEY_STATE_UP);
                 return 0;
@@ -996,6 +1019,10 @@ static void reinit_window_state(struct vo_w32_state *w32)
     int screen_h = w32->screenrc.y1 - w32->screenrc.y0;
 
     if (w32->current_fs) {
+        // Cancel window-dragging when entering fullscreen
+        if (w32->client_area_dragging)
+            SendMessage(w32->window, WM_LBUTTONUP, HTCAPTION, 0);
+
         // Save window position and size when switching to fullscreen.
         if (toggle_fs) {
             w32->prev_width = w32->dw;
