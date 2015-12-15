@@ -1526,6 +1526,9 @@ static void pass_convert_yuv(struct gl_video *p)
 
     if (!p->has_alpha || p->opts.alpha_mode == 0) { // none
         GLSL(color.a = 1.0;)
+    } else if (p->opts.alpha_mode == 1 &&
+            (p->gl->mpgl_caps & MPGL_CAP_PREMUL_ALPHA)) { // premultiply alpha
+        GLSL(color.rgb *= color.a;)
     } else if (p->opts.alpha_mode == 2) { // blend
         GLSL(color = vec4(color.rgb * color.a, 1.0);)
     }

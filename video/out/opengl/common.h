@@ -64,6 +64,8 @@ enum {
     MPGL_CAP_3D_TEX             = (1 << 15),
     MPGL_CAP_DEBUG              = (1 << 16),
     MPGL_CAP_DXINTEROP          = (1 << 17),    // WGL_NV_DX_interop
+    MPGL_CAP_DXINTEROP2         = (1 << 18),    // WGL_NV_DX_interop2
+    MPGL_CAP_PREMUL_ALPHA       = (1 << 19),    // expects premultiplied alpha
     MPGL_CAP_SW                 = (1 << 30),    // indirect or sw renderer
 };
 
@@ -235,10 +237,13 @@ struct GL {
     void (GLAPIENTRY *BindAttribLocation)(GLuint, GLuint, const GLchar *);
     void (GLAPIENTRY *BindFramebuffer)(GLenum, GLuint);
     void (GLAPIENTRY *GenFramebuffers)(GLsizei, GLuint *);
+    void (GLAPIENTRY *GenRenderbuffers)(GLsizei, GLuint *);
     void (GLAPIENTRY *DeleteFramebuffers)(GLsizei, const GLuint *);
+    void (GLAPIENTRY *DeleteRenderbuffers)(GLsizei, const GLuint *);
     GLenum (GLAPIENTRY *CheckFramebufferStatus)(GLenum);
     void (GLAPIENTRY *FramebufferTexture2D)(GLenum, GLenum, GLenum, GLuint,
                                             GLint);
+    void (GLAPIENTRY *FramebufferRenderbuffer)(GLenum, GLenum, GLenum, GLuint);
     void (GLAPIENTRY *BlitFramebuffer)(GLint, GLint, GLint, GLint, GLint, GLint,
                                        GLint, GLint, GLbitfield, GLenum);
 

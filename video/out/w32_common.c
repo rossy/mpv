@@ -1209,7 +1209,7 @@ static void *gui_thread(void *ptr)
                                       0, 0, r.right, r.bottom,
                                       w32->parent, 0, hInstance, NULL);
     } else {
-        w32->window = CreateWindowExW(0, classname,
+        w32->window = CreateWindowExW(0x00200000L, classname,
                                       classname,
                                       update_style(w32, 0),
                                       CW_USEDEFAULT, SW_HIDE, 100, 100,

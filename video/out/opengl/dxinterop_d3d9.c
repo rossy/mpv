@@ -1,34 +1,26 @@
 /*
  * This file is part of mpv.
  *
- * mpv is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * mpv is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * mpv is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * GNU Lesser General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License along
- * with mpv.  If not, see <http://www.gnu.org/licenses/>.
- *
- * You can alternatively redistribute this file and/or
- * modify it under the terms of the GNU Lesser General Public
- * License as published by the Free Software Foundation; either
- * version 2.1 of the License, or (at your option) any later version.
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #include <windows.h>
 #include <initguid.h>
 #include <d3d9.h>
 #include <dwmapi.h>
-#include "video/out/w32_common.h"
-#include "common.h"
 
-// For WGL_ACCESS_WRITE_DISCARD_NV, etc.
-#include <GL/wglext.h>
+#include "dxinterop_common.h"
 
 // mingw-w64 header typo?
 #ifndef IDirect3DSwapChain9Ex_GetBackBuffer
@@ -36,6 +28,8 @@
 #endif
 
 struct priv {
+    struct offscreen_gl osgl;
+
     HMODULE d3d9_dll;
     HRESULT (WINAPI *Direct3DCreate9Ex)(UINT SDKVersion, IDirect3D9Ex **ppD3D);
 
@@ -47,11 +41,6 @@ struct priv {
     IDirect3DSurface9 *backbuffer;
     IDirect3DSurface9 *rtarget;
     HANDLE rtarget_h;
-
-    // OpenGL offscreen context
-    HWND os_wnd;
-    HDC os_dc;
-    HGLRC os_ctx;
 
     // OpenGL resources
     GLuint framebuffer;
@@ -80,144 +69,6 @@ static void pump_message_loop(void)
     MSG message;
     while (PeekMessageW(&message, NULL, 0, 0, PM_REMOVE))
         DispatchMessageW(&message);
-}
-
-static void *w32gpa(const GLubyte *procName)
-{
-    HMODULE oglmod;
-    void *res = wglGetProcAddress(procName);
-    if (res)
-        return res;
-    oglmod = GetModuleHandleW(L"opengl32.dll");
-    return GetProcAddress(oglmod, procName);
-}
-
-static int os_ctx_create(struct MPGLContext *ctx)
-{
-    static const wchar_t os_wnd_class[] = L"mpv offscreen gl";
-    struct priv *p = ctx->priv;
-    HGLRC legacy_context = NULL;
-
-    RegisterClassExW(&(WNDCLASSEXW) {
-        .cbSize = sizeof(WNDCLASSEXW),
-        .style = CS_OWNDC,
-        .lpfnWndProc = DefWindowProc,
-        .hInstance = GetModuleHandleW(NULL),
-        .lpszClassName = os_wnd_class,
-    });
-
-    // Create a hidden window for an offscreen OpenGL context. It might also be
-    // possible to use the VO window, but MSDN recommends against drawing to
-    // the same window with flip mode present and other APIs, so play it safe.
-    p->os_wnd = CreateWindowExW(0, os_wnd_class, os_wnd_class, 0, 0, 0, 200,
-        200, NULL, NULL, GetModuleHandleW(NULL), NULL);
-    p->os_dc = GetDC(p->os_wnd);
-    if (!p->os_dc) {
-        MP_FATAL(ctx->vo, "Couldn't create window for offscreen rendering\n");
-        goto fail;
-    }
-
-    // Choose a pixel format. It probably doesn't matter what this is because
-    // the primary framebuffer will not be used.
-    PIXELFORMATDESCRIPTOR pfd = {
-        .nSize = sizeof pfd,
-        .nVersion = 1,
-        .dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER,
-        .iPixelType = PFD_TYPE_RGBA,
-        .cColorBits = 24,
-        .iLayerType = PFD_MAIN_PLANE,
-    };
-    int pf = ChoosePixelFormat(p->os_dc, &pfd);
-    if (!pf) {
-        MP_FATAL(ctx->vo, "Couldn't choose pixelformat for offscreen rendering\n");
-        goto fail;
-    }
-    SetPixelFormat(p->os_dc, pf, &pfd);
-
-    legacy_context = wglCreateContext(p->os_dc);
-    if (!legacy_context || !wglMakeCurrent(p->os_dc, legacy_context)) {
-        MP_FATAL(ctx->vo, "Couldn't create GL context for offscreen rendering\n");
-        goto fail;
-    }
-
-    const char *(GLAPIENTRY *wglGetExtensionsStringARB)(HDC hdc)
-        = w32gpa((const GLubyte*)"wglGetExtensionsStringARB");
-    if (!wglGetExtensionsStringARB) {
-        MP_FATAL(ctx->vo, "The OpenGL driver does not support OpenGL 3.x\n");
-        goto fail;
-    }
-
-    const char *wgl_exts = wglGetExtensionsStringARB(p->os_dc);
-    if (!strstr(wgl_exts, "WGL_ARB_create_context")) {
-        MP_FATAL(ctx->vo, "The OpenGL driver does not support OpenGL 3.x\n");
-        goto fail;
-    }
-
-    HGLRC (GLAPIENTRY *wglCreateContextAttribsARB)(HDC hDC, HGLRC hShareContext,
-                                                   const int *attribList)
-        = w32gpa((const GLubyte*)"wglCreateContextAttribsARB");
-    if (!wglCreateContextAttribsARB) {
-        MP_FATAL(ctx->vo, "The OpenGL driver does not support OpenGL 3.x\n");
-        goto fail;
-    }
-
-    int attribs[] = {
-        WGL_CONTEXT_MAJOR_VERSION_ARB, 3,
-        WGL_CONTEXT_MINOR_VERSION_ARB, 0,
-        WGL_CONTEXT_FLAGS_ARB, 0,
-        WGL_CONTEXT_PROFILE_MASK_ARB, WGL_CONTEXT_CORE_PROFILE_BIT_ARB,
-        0
-    };
-
-    p->os_ctx = wglCreateContextAttribsARB(p->os_dc, 0, attribs);
-    if (!p->os_ctx) {
-        // NVidia, instead of ignoring WGL_CONTEXT_FLAGS_ARB, will error out if
-        // it's present on pre-3.2 contexts.
-        // Remove it from attribs and retry the context creation.
-        attribs[6] = attribs[7] = 0;
-        p->os_ctx = wglCreateContextAttribsARB(p->os_dc, 0, attribs);
-    }
-    if (!p->os_ctx) {
-        MP_FATAL(ctx->vo, "Couldn't create GL 3.x context for offscreen rendering\n");
-        goto fail;
-    }
-
-    wglMakeCurrent(p->os_dc, NULL);
-    wglDeleteContext(legacy_context);
-    legacy_context = NULL;
-
-    if (!wglMakeCurrent(p->os_dc, p->os_ctx)) {
-        MP_FATAL(ctx->vo, "Couldn't create GL 3.x context for offscreen rendering\n");
-        goto fail;
-    }
-
-    mpgl_load_functions(ctx->gl, w32gpa, wgl_exts, ctx->vo->log);
-    if (!(ctx->gl->mpgl_caps & MPGL_CAP_DXINTEROP)) {
-        MP_FATAL(ctx->vo, "WGL_NV_DX_interop is not supported\n");
-        goto fail;
-    }
-
-    return 0;
-fail:
-    if (legacy_context) {
-        wglMakeCurrent(p->os_dc, NULL);
-        wglDeleteContext(legacy_context);
-    }
-    return -1;
-}
-
-static void os_ctx_destroy(MPGLContext *ctx)
-{
-    struct priv *p = ctx->priv;
-
-    if (p->os_ctx) {
-        wglMakeCurrent(p->os_dc, NULL);
-        wglDeleteContext(p->os_ctx);
-    }
-    if (p->os_dc)
-        ReleaseDC(p->os_wnd, p->os_dc);
-    if (p->os_wnd)
-        DestroyWindow(p->os_wnd);
 }
 
 static void try_attach_texture(MPGLContext *ctx)
@@ -331,6 +182,7 @@ static int d3d_size_dependent_create(MPGLContext *ctx)
 
     return 0;
 }
+
 
 static void d3d_size_dependent_destroy(MPGLContext *ctx)
 {
@@ -457,11 +309,13 @@ static void d3d_destroy(MPGLContext *ctx)
         FreeLibrary(p->d3d9_dll);
 }
 
-static void dxinterop_uninit(MPGLContext *ctx)
+static void d3d9_uninit(MPGLContext *ctx)
 {
+    struct priv *p = ctx->priv;
+
     d3d_size_dependent_destroy(ctx);
     d3d_destroy(ctx);
-    os_ctx_destroy(ctx);
+    mp_dxinterop_os_gl_destroy(ctx, &p->osgl);
     vo_w32_uninit(ctx->vo);
     DwmEnableMMCSS(FALSE);
     pump_message_loop();
@@ -488,7 +342,7 @@ static GLAPIENTRY void dxinterop_bind_framebuffer(GLenum target,
     try_attach_texture(current_ctx);
 }
 
-static void dxinterop_reset(struct MPGLContext *ctx)
+static void d3d9_reset(struct MPGLContext *ctx)
 {
     struct priv *p = ctx->priv;
     HRESULT hr;
@@ -530,11 +384,11 @@ static int GLAPIENTRY dxinterop_swap_interval(int interval)
     struct priv *p = current_ctx->priv;
 
     p->requested_swapinterval = interval;
-    dxinterop_reset(current_ctx);
+    d3d9_reset(current_ctx);
     return 1;
 }
 
-static int dxinterop_init(struct MPGLContext *ctx, int flags)
+static int d3d9_init(struct MPGLContext *ctx, int flags)
 {
     struct priv *p = ctx->priv;
     struct GL *gl = ctx->gl;
@@ -543,8 +397,12 @@ static int dxinterop_init(struct MPGLContext *ctx, int flags)
 
     if (!vo_w32_init(ctx->vo))
         goto fail;
-    if (os_ctx_create(ctx) < 0)
+    if (mp_dxinterop_os_gl_init(ctx, &p->osgl) < 0)
         goto fail;
+    if (!(ctx->gl->mpgl_caps & MPGL_CAP_DXINTEROP)) {
+        MP_FATAL(ctx->vo, "WGL_NV_DX_interop is not supported\n");
+        goto fail;
+    }
 
     // Create the shared framebuffer
     gl->GenFramebuffers(1, &p->framebuffer);
@@ -574,17 +432,17 @@ static int dxinterop_init(struct MPGLContext *ctx, int flags)
 
     return 0;
 fail:
-    dxinterop_uninit(ctx);
+    d3d9_uninit(ctx);
     return -1;
 }
 
-static int dxinterop_reconfig(struct MPGLContext *ctx)
+static int d3d9_reconfig(struct MPGLContext *ctx)
 {
     vo_w32_config(ctx->vo);
     return 0;
 }
 
-static void dxinterop_swap_buffers(MPGLContext *ctx)
+static void d3d9_swap_buffers(MPGLContext *ctx)
 {
     struct priv *p = ctx->priv;
     struct GL *gl = ctx->gl;
@@ -594,7 +452,7 @@ static void dxinterop_swap_buffers(MPGLContext *ctx)
 
     // If the device is still lost, try to reset it again
     if (p->lost_device)
-        dxinterop_reset(ctx);
+        d3d9_reset(ctx);
     if (p->lost_device)
         return;
 
@@ -622,7 +480,7 @@ static void dxinterop_swap_buffers(MPGLContext *ctx)
     case D3DERR_DEVICEHUNG:
         MP_VERBOSE(ctx->vo, "Direct3D device lost! Resetting.\n");
         p->lost_device = true;
-        dxinterop_reset(ctx);
+        d3d9_reset(ctx);
         break;
     default:
         if (FAILED(hr))
@@ -630,21 +488,20 @@ static void dxinterop_swap_buffers(MPGLContext *ctx)
     }
 }
 
-static int dxinterop_control(MPGLContext *ctx, int *events, int request,
-                             void *arg)
+static int d3d9_control(MPGLContext *ctx, int *events, int request, void *arg)
 {
     int r = vo_w32_control(ctx->vo, events, request, arg);
     if (*events & VO_EVENT_RESIZE)
-        dxinterop_reset(ctx);
+        d3d9_reset(ctx);
     return r;
 }
 
-const struct mpgl_driver mpgl_driver_dxinterop = {
-    .name         = "dxinterop",
+const struct mpgl_driver mpgl_driver_d3d9 = {
+    .name         = "d3d9",
     .priv_size    = sizeof(struct priv),
-    .init         = dxinterop_init,
-    .reconfig     = dxinterop_reconfig,
-    .swap_buffers = dxinterop_swap_buffers,
-    .control      = dxinterop_control,
-    .uninit       = dxinterop_uninit,
+    .init         = d3d9_init,
+    .reconfig     = d3d9_reconfig,
+    .swap_buffers = d3d9_swap_buffers,
+    .control      = d3d9_control,
+    .uninit       = d3d9_uninit,
 };

@@ -211,8 +211,11 @@ static const struct gl_functions gl_functions[] = {
         .provides = MPGL_CAP_FB,
         .functions = (const struct gl_function[]) {
             DEF_FN(BindFramebuffer),
+            DEF_FN(FramebufferRenderbuffer),
             DEF_FN(GenFramebuffers),
+            DEF_FN(GenRenderbuffers),
             DEF_FN(DeleteFramebuffers),
+            DEF_FN(DeleteRenderbuffers),
             DEF_FN(CheckFramebufferStatus),
             DEF_FN(FramebufferTexture2D),
             {0}
@@ -303,6 +306,10 @@ static const struct gl_functions gl_functions[] = {
             DEF_FN_NAME(DXUnlockObjectsNV, "wglDXUnlockObjectsNV"),
             {0}
         },
+    },
+    {
+        .extension = "WGL_NV_DX_interop2",
+        .provides = MPGL_CAP_DXINTEROP2,
     },
 #endif
     // Apple Packed YUV Formats
@@ -543,7 +550,8 @@ extern const struct mpgl_driver mpgl_driver_cocoa;
 extern const struct mpgl_driver mpgl_driver_wayland;
 extern const struct mpgl_driver mpgl_driver_w32;
 extern const struct mpgl_driver mpgl_driver_angle;
-extern const struct mpgl_driver mpgl_driver_dxinterop;
+extern const struct mpgl_driver mpgl_driver_d3d11;
+extern const struct mpgl_driver mpgl_driver_d3d9;
 extern const struct mpgl_driver mpgl_driver_rpi;
 
 static const struct mpgl_driver *const backends[] = {
@@ -560,7 +568,8 @@ static const struct mpgl_driver *const backends[] = {
     &mpgl_driver_w32,
 #endif
 #if HAVE_GL_DXINTEROP
-    &mpgl_driver_dxinterop,
+    &mpgl_driver_d3d11,
+    &mpgl_driver_d3d9,
 #endif
 #if HAVE_GL_WAYLAND
     &mpgl_driver_wayland,
