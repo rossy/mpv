@@ -146,6 +146,29 @@ void mp_get_src_dst_rects(struct mp_log *log, struct mp_vo_opts *opts,
                               opts->zoom, opts->align_y, opts->pan_y,
                               &src.y0, &src.y1, &dst.y0, &dst.y1,
                               &osd.mt, &osd.mb);
+
+        // If using --keepaspect-window, check for rounding errors between the
+        // video aspect and the window aspect and fix them up, so the video
+        // touches the window from all sides without thin black bars
+        if (opts->keepaspect_window) {
+            // If three sides touch the outside of the window and one doesn't,
+            // check which side doesn't touch and adjust it
+            if ((!dst.x0) + (dst.x1 == window_w) + (!dst.y0) + (dst.y1 == window_h) == 3) {
+                if (dst.x0 == 1) {
+                    dst.x0 = 0;
+                    osd.ml--;
+                } else if (dst.x1 == window_w - 1) {
+                    dst.x1 = window_w;
+                    osd.mr--;
+                } else if (dst.y0 == 1) {
+                    dst.y0 = 0;
+                    osd.mt--;
+                } else if (dst.y1 == window_h - 1) {
+                    dst.y1 = window_h;
+                    osd.mb--;
+                }
+            }
+        }
     }
 
     *out_src = src;
