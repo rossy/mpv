@@ -48,6 +48,10 @@
 EXTERN_C IMAGE_DOS_HEADER __ImageBase;
 #define HINST_THISCOMPONENT ((HINSTANCE)&__ImageBase)
 
+#ifndef WM_DPICHANGED
+#define WM_DPICHANGED 0x02E0
+#endif
+
 static const wchar_t classname[] = L"mpv";
 
 static __thread struct vo_w32_state *w32_thread_context;
@@ -118,6 +122,13 @@ struct vo_w32_state {
     double display_fps;
 
     HANDLE avrt_handle;
+
+    bool non_client_dpi_scaling;
+    BOOL WINAPI (*pEnableNonClientDpiScaling)(HWND hwnd);
+    UINT WINAPI (*pGetDpiForWindow)(HWND hwnd);
+    BOOL WINAPI (*pAdjustWindowRectExForDpi)(LPRECT lpRect, DWORD dwStyle,
+        BOOL bMenu, DWORD dwExStyle, UINT dpi);
+    int WINAPI (*pGetSystemMetricsForDpi)(int nIndex, UINT dpi);
 };
 
 typedef struct tagDropTarget {
@@ -317,16 +328,24 @@ static void DropTarget_Init(DropTarget* This, struct vo_w32_state *w32)
     This->w32 = w32;
 }
 
-static void add_window_borders(HWND hwnd, RECT *rc)
+static void add_window_borders(struct vo_w32_state *w32, HWND hwnd, RECT *rc)
 {
-    AdjustWindowRect(rc, GetWindowLong(hwnd, GWL_STYLE), 0);
+    if (w32->non_client_dpi_scaling) {
+        w32->pAdjustWindowRectExForDpi(rc, GetWindowLong(hwnd, GWL_STYLE),
+            FALSE, GetWindowLong(hwnd, GWL_EXSTYLE),
+            w32->pGetDpiForWindow(hwnd));
+    } else {
+        AdjustWindowRectEx(rc, GetWindowLong(hwnd, GWL_STYLE), FALSE,
+            GetWindowLong(hwnd, GWL_EXSTYLE));
+    }
 }
 
 // basically a reverse AdjustWindowRect (win32 doesn't appear to have this)
-static void subtract_window_borders(HWND hwnd, RECT *rc)
+static void subtract_window_borders(struct vo_w32_state *w32, HWND hwnd,
+                                    RECT *rc)
 {
     RECT b = { 0, 0, 0, 0 };
-    add_window_borders(hwnd, &b);
+    add_window_borders(w32, hwnd, &b);
     rc->left -= b.left;
     rc->top -= b.top;
     rc->right -= b.right;
@@ -341,38 +360,43 @@ static LRESULT borderless_nchittest(struct vo_w32_state *w32, int x, int y)
     POINT mouse = { x, y };
     ScreenToClient(w32->window, &mouse);
 
+    int frame_size, border_size;
+    if (w32->pGetSystemMetricsForDpi) {
+        UINT dpi = w32->pGetDpiForWindow(w32->window);
+        // The horizontal frame should be the same size as the vertical frame,
+        // since the NONCLIENTMETRICS structure does not distinguish between
+        // them
+        frame_size = w32->pGetSystemMetricsForDpi(SM_CXFRAME, dpi) +
+                     w32->pGetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+        border_size = w32->pGetSystemMetricsForDpi(SM_CXBORDER, dpi);
+    } else {
+        frame_size = GetSystemMetrics(SM_CXFRAME) +
+                     GetSystemMetrics(SM_CXPADDEDBORDER);
+        border_size = GetSystemMetrics(SM_CXBORDER);
+    }
     // The diagonal size handles are slightly wider than the side borders
-    int handle_width = GetSystemMetrics(SM_CXSMSIZE) +
-                       GetSystemMetrics(SM_CXBORDER);
+    int diagonal_width = frame_size * 2 + border_size;
 
-    // Hit-test top border
-    int frame_height = GetSystemMetrics(SM_CYFRAME) +
-                       GetSystemMetrics(SM_CXPADDEDBORDER);
-    if (mouse.y < frame_height) {
-        if (mouse.x < handle_width)
+    if (mouse.y < frame_size) {
+        if (mouse.x < diagonal_width)
             return HTTOPLEFT;
-        if (mouse.x > w32->dw - handle_width)
+        if (mouse.x >= w32->dw - diagonal_width)
             return HTTOPRIGHT;
         return HTTOP;
     }
 
-    // Hit-test bottom border
-    if (mouse.y > w32->dh - frame_height) {
-        if (mouse.x < handle_width)
+    if (mouse.y >= w32->dh - frame_size) {
+        if (mouse.x < diagonal_width)
             return HTBOTTOMLEFT;
-        if (mouse.x > w32->dw - handle_width)
+        if (mouse.x >= w32->dw - diagonal_width)
             return HTBOTTOMRIGHT;
         return HTBOTTOM;
     }
 
-    // Hit-test side borders
-    int frame_width = GetSystemMetrics(SM_CXFRAME) +
-                      GetSystemMetrics(SM_CXPADDEDBORDER);
-    if (mouse.x < frame_width)
+    if (mouse.x < frame_size)
         return HTLEFT;
-    if (mouse.x > w32->dw - frame_width)
+    if (mouse.x >= w32->dw - frame_size)
         return HTRIGHT;
-
     return HTCLIENT;
 }
 
@@ -693,6 +717,12 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
         // This message is used to wakeup the GUI thread, see wakeup_gui_thread.
         mp_dispatch_queue_process(w32->dispatch, 0);
         break;
+    case WM_NCCREATE:
+        if (w32->pEnableNonClientDpiScaling) {
+            if (w32->pEnableNonClientDpiScaling(hWnd))
+                w32->non_client_dpi_scaling = true;
+        }
+        break;
     case WM_ERASEBKGND: // no need to erase background separately
         return 1;
     case WM_PAINT:
@@ -722,6 +752,13 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
         update_display_info(w32);
         break;
     }
+    case WM_DPICHANGED: {
+        RECT *r = (RECT*)lParam;
+        SetWindowPos(hWnd, NULL, r->left, r->top, r->right - r->left,
+            r->bottom - r->top,
+            SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOZORDER);
+        break;
+    }
     case WM_SIZING:
         if (w32->opts->keepaspect && w32->opts->keepaspect_window &&
             !w32->current_fs && !w32->parent)
@@ -730,7 +767,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
             // get client area of the windows if it had the rect rc
             // (subtracting the window borders)
             RECT r = *rc;
-            subtract_window_borders(w32->window, &r);
+            subtract_window_borders(w32, w32->window, &r);
             int c_w = r.right - r.left, c_h = r.bottom - r.top;
             float aspect = w32->o_dwidth / (float) MPMAX(w32->o_dheight, 1);
             int d_w = c_h * aspect - c_w;
@@ -1069,7 +1106,7 @@ static void reinit_window_state(struct vo_w32_state *w32)
     SetWindowLong(w32->window, GWL_STYLE, style);
 
     RECT cr = r;
-    add_window_borders(w32->window, &r);
+    add_window_borders(w32, w32->window, &r);
     // Check on client area size instead of window size on --fit-border=no
     long o_w;
     long o_h;
@@ -1111,7 +1148,7 @@ static void reinit_window_state(struct vo_w32_state *w32)
         long o_cy = r.top + (r.bottom - r.top) / 2;
         // Add window borders to the new window size
         r = (RECT){.right = n_w, .bottom = n_h};
-        add_window_borders(w32->window, &r);
+        add_window_borders(w32, w32->window, &r);
         // Get top and left border size for client area position calculation
         long b_top = -r.top;
         long b_left = -r.left;
@@ -1223,6 +1260,16 @@ static void *gui_thread(void *ptr)
     mpthread_set_name("win32 window");
 
     thread_disable_ime();
+
+    HMODULE user32 = GetModuleHandleW(L"user32.dll");
+    w32->pGetDpiForWindow =
+        (void*)GetProcAddress(user32, "GetDpiForWindow");
+    w32->pAdjustWindowRectExForDpi =
+        (void*)GetProcAddress(user32, "AdjustWindowRectExForDpi");
+    w32->pEnableNonClientDpiScaling =
+        (void*)GetProcAddress(user32, "EnableNonClientDpiScaling");
+    w32->pGetSystemMetricsForDpi =
+        (void*)GetProcAddress(user32, "GetSystemMetricsForDpi");
 
     WNDCLASSEXW wcex = {
         .cbSize = sizeof wcex,
