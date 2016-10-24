@@ -31,6 +31,8 @@
 #include "sub/osd.h"
 #include "video/sws_utils.h"
 #include "video/mp_image.h"
+#include "osdep/terminal.h"
+#include "osdep/io.h"
 
 #define IMGFMT IMGFMT_BGR24
 
@@ -175,17 +177,13 @@ static void write_half_blocks(
     printf("\n");
 }
 
-static void get_win_size(struct vo *vo, int *out_width, int *out_height) {
+static void get_win_size(struct vo *vo, int *out_width, int *out_height)
+{
     struct priv *p = vo->priv;
-#if HAVE_POSIX
-    struct winsize winsize;
-    ioctl(STDOUT_FILENO, TIOCGWINSZ, &winsize);
-    *out_width = winsize.ws_col;
-    *out_height = winsize.ws_row;
-#else
+
     *out_width = DEFAULT_WIDTH;
     *out_height = DEFAULT_HEIGHT;
-#endif
+    terminal_get_size(out_width, out_height);
 
     if (p->opts->width > 0)
         *out_width = p->opts->width;

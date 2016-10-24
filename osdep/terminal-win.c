@@ -39,6 +39,9 @@
 #define hSTDERR GetStdHandle(STD_ERROR_HANDLE)
 
 #define FOREGROUND_ALL (FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE)
+#ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
+#define ENABLE_VIRTUAL_TERMINAL_PROCESSING (0x0004)
+#endif
 
 static short stdoutAttrs = 0;
 static const unsigned char ansi2win32[8] = {
@@ -62,7 +65,7 @@ void terminal_get_size(int *w, int *h)
     CONSOLE_SCREEN_BUFFER_INFO cinfo;
     if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &cinfo)) {
         *w = cinfo.dwMaximumWindowSize.X - 1;
-        *h = cinfo.dwMaximumWindowSize.Y;
+        *h = cinfo.srWindow.Bottom - cinfo.srWindow.Top;
     }
 }
 
@@ -175,6 +178,13 @@ static void write_console_text(HANDLE wstream, char *buf)
 // Mutates the input argument (buf), because we're evil.
 void mp_write_console_ansi(HANDLE wstream, char *buf)
 {
+    DWORD mode = 0;
+    GetConsoleMode(wstream, &mode);
+    if (mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING) {
+        write_console_text(wstream, buf);
+        return;
+    }
+
     while (*buf) {
         char *next = strchr(buf, '\033');
         if (!next) {
@@ -291,6 +301,9 @@ int terminal_init(void)
     DWORD cmode = 0;
     GetConsoleMode(hSTDOUT, &cmode);
     cmode |= (ENABLE_PROCESSED_OUTPUT | ENABLE_WRAP_AT_EOL_OUTPUT);
+    SetConsoleMode(hSTDOUT, cmode);
+    SetConsoleMode(hSTDERR, cmode);
+    cmode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
     SetConsoleMode(hSTDOUT, cmode);
     SetConsoleMode(hSTDERR, cmode);
     GetConsoleScreenBufferInfo(hSTDOUT, &cinfo);
