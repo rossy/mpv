@@ -251,7 +251,7 @@ static bool is_a_console(HANDLE h)
     return GetConsoleMode(h, &(DWORD){0});
 }
 
-static void reopen_console_handle(DWORD std, int fd, FILE *stream)
+static void reopen_console_output(DWORD std, int fd, FILE *stream)
 {
     if (is_a_console(GetStdHandle(std))) {
         freopen("CONOUT$", "wt", stream);
@@ -279,8 +279,13 @@ bool terminal_try_attach(void)
 
     // We have a console window. Redirect output streams to that console's
     // low-level handles, so things that use printf directly work later on.
-    reopen_console_handle(STD_OUTPUT_HANDLE, STDOUT_FILENO, stdout);
-    reopen_console_handle(STD_ERROR_HANDLE, STDERR_FILENO, stderr);
+    reopen_console_output(STD_OUTPUT_HANDLE, STDOUT_FILENO, stdout);
+    reopen_console_output(STD_ERROR_HANDLE, STDERR_FILENO, stderr);
+    if (is_a_console(GetStdHandle(STD_INPUT_HANDLE))) {
+        freopen("CONIN$", "rt", stdin);
+        dup2(fileno(stdin), STDIN_FILENO);
+        setvbuf(stdin, NULL, _IONBF, 0);
+    }
 
     return true;
 }

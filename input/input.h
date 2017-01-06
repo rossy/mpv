@@ -254,8 +254,6 @@ void mp_input_run_cmd(struct input_ctx *ictx, const char **cmd);
 
 void mp_input_set_repeat_info(struct input_ctx *ictx, int rate, int delay);
 
-void mp_input_pipe_add(struct input_ctx *ictx, const char *filename);
-
 struct mp_ipc_ctx;
 struct mp_client_api;
 struct mp_ipc_ctx *mp_init_ipc(struct mp_client_api *client_api,

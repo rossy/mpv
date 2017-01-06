@@ -1302,11 +1302,6 @@ void mp_input_load_config(struct input_ctx *ictx)
         cocoa_start_event_monitor();
 #endif
 
-#if defined(__MINGW32__)
-    if (ictx->global->opts->input_file && *ictx->global->opts->input_file)
-        mp_input_pipe_add(ictx, ictx->global->opts->input_file);
-#endif
-
     input_unlock(ictx);
 }
 

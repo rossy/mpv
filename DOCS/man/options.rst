@@ -2778,17 +2778,36 @@ Input
 
 ``--input-file=<filename>``
     Read commands from the given file. Mostly useful with a FIFO. Since
-    mpv 0.7.0 also understands JSON commands (see `JSON IPC`_), but you can't
-    get replies or events. Use ``--input-ipc-server`` for something
-    bi-directional. On MS Windows, JSON commands are not available.
+    mpv 0.7.0 also understands JSON commands (see `JSON IPC`_) however,
+    depending on the source, you may not be able to get replies or events.
 
-    This can also specify a direct file descriptor with ``fd://N`` (UNIX only).
-    In this case, JSON replies will be written if the FD is writable.
+    ``--input-file`` accepts the following input sources:
 
-    .. note::
+    ``/path/to/file``
+        Opens and reads input commands from an ordinary file or FIFO in the
+        filesystem. JSON replies will not be written.
 
-        When the given file is a FIFO mpv opens both ends, so you can do several
-        `echo "seek 10" > mp_pipe` and the pipe will stay valid.
+        .. note::
+
+            When the given file is a FIFO mpv opens both ends, so you can do
+            several `echo "seek 10" > mp_pipe` and the pipe will stay valid.
+
+    ``\\.\pipe\<name>``
+        Connects to a pipe server and reads input commands (Windows only.) JSON
+        replies will be written if the pipe is writable.
+
+    ``/dev/stdin``
+        Reads input from stdin, even on non-Linux.
+
+    ``fd://N``
+        Reads input from the specified file descriptor. JSON replies will be
+        written if the FD is writable.
+
+    ``handle://0xNNNNNNNN``
+        Reads input from an inherited file HANDLE (Windows only.) Supports both
+        synchronous and overlapped handles. As above, JSON replies will be
+        written if the HANDLE is writable.
+
 
 ``--input-terminal``, ``--no-input-terminal``
     ``--no-input-terminal`` prevents the player from reading key events from

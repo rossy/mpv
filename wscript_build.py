@@ -220,7 +220,6 @@ def build(ctx):
         ( "input/ipc-unix.c",                    "!mingw" ),
         ( "input/ipc-win.c",                     "mingw" ),
         ( "input/keycodes.c" ),
-        ( "input/pipe-win32.c",                  "mingw" ),
 
         ## Misc
         ( "misc/bstr.c" ),

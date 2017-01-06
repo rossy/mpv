@@ -16,6 +16,9 @@
  */
 
 #include <windows.h>
+#include <versionhelpers.h>
+#include <winternl.h>
+#include <ntstatus.h>
 #include <sddl.h>
 
 #include "config.h"
@@ -30,6 +33,7 @@
 #include "input/input.h"
 #include "libmpv/client.h"
 #include "options/options.h"
+#include "options/path.h"
 #include "player/client.h"
 
 struct mp_ipc_ctx {
@@ -47,7 +51,10 @@ struct client_arg {
 
     char *client_name;
     HANDLE client_h;
+    bool close_client_h;
     bool writable;
+    bool sync; // The file was not opened in overlapped mode (--input-file only)
+    bool disk_file; // The file is an ordinary disk file with a file pointer
     OVERLAPPED write_ol;
 };
 
@@ -133,21 +140,99 @@ static PSECURITY_DESCRIPTOR create_restricted_sd(void)
     return sd;
 }
 
-static void wakeup_cb(void *d)
+static NTSTATUS win32_error_to_nt_status(DWORD err)
 {
-    HANDLE event = d;
-    SetEvent(event);
+    if (!err)
+        return STATUS_SUCCESS;
+    // 0x8007xxxx NTSTATUSes are wrapped Win32 errors. RtlNtStatusToDosError
+    // will round-trip these back to Win32 error codes.
+    return 0x80070000 | (err & 0xffff);
 }
 
-// Wrapper for ReadFile that treats ERROR_IO_PENDING as success
-static DWORD async_read(HANDLE file, void *buf, unsigned size, OVERLAPPED* ol)
+struct tp_data {
+    HANDLE file;
+    void *buf;
+    DWORD size;
+    OVERLAPPED *ol;
+};
+
+static void tp_read(PTP_CALLBACK_INSTANCE inst, void *ctx)
 {
-    DWORD err = ReadFile(file, buf, size, NULL, ol) ? 0 : GetLastError();
-    return err == ERROR_IO_PENDING ? 0 : err;
+    CallbackMayRunLong(inst);
+
+    struct tp_data d = *(struct tp_data*)ctx;
+    talloc_free(ctx);
+
+    DWORD err = ReadFile(d.file, d.buf, d.size, NULL, d.ol) ? 0 : GetLastError();
+
+    // Check if the IO operation failed before it started. If this is the case,
+    // ol->Internal will still be set to STATUS_PENDING.
+    if (err != ERROR_IO_PENDING && d.ol->Internal == STATUS_PENDING) {
+        // Convert the Win32 error code to an NTSTATUS. GetOverlappedResult
+        // will call SetLastError with this code. Note: The 'Internal' field is
+        // not actually internal. It's documented to contain the NTSTATUS code
+        // of the IO operation and other APIs rely on this.
+        d.ol->Internal = win32_error_to_nt_status(err);
+        // If an IO operation was not started, the event will still be in the
+        // non-signaled state. Signal it so the caller can pick up the error.
+        SetEvent(d.ol->hEvent);
+    }
+}
+
+// An asynchronous ReadFile abstraction that works with both overlapped and
+// synchronous handles. It makes synchronous read operations look asynchronous
+// by running them on the thread pool. In both cases, GetOverlappedResult can
+// be used to retrieve the result.
+static DWORD begin_read(HANDLE file, bool sync, void *buf, unsigned size,
+                        OVERLAPPED* ol)
+{
+    DWORD err;
+    if (!sync) {
+        // If the handle is overlapped, just do asynchronous IO
+        err = ReadFile(file, buf, size, NULL, ol) ? 0 : GetLastError();
+        return err == ERROR_IO_PENDING ? 0 : err;
+    }
+
+    // Make it look like the IO operation has started. This bit should be done
+    // synchronously rather than on the thread pool, so GetOverlappedResult
+    // and WaitForMultipleObjects don't return before the operation begins.
+    ol->Internal = STATUS_PENDING;
+    ol->InternalHigh = 0;
+    ResetEvent(ol->hEvent);
+
+    struct tp_data *d = talloc_ptrtype(NULL, d);
+    *d = (struct tp_data) { file, buf, size, ol };
+
+    err = TrySubmitThreadpoolCallback(tp_read, d, NULL) ? 0 : GetLastError();
+    if (err) {
+        talloc_free(d);
+        // Convert the Win32 error code to an NTSTATUS
+        ol->Internal = win32_error_to_nt_status(err);
+        SetEvent(ol->hEvent);
+    }
+
+    return err;
+}
+
+// CancelIoEx abstraction that can cancel both overlapped and synchronous reads
+// issued by begin_read. Basically just calls CancelIoEx, but with retry logic.
+static bool cancel_io(HANDLE file, bool sync, OVERLAPPED* ol)
+{
+    DWORD err;
+    do {
+        if (!(err = CancelIoEx(file, ol) ? 0 : GetLastError()))
+            return true;
+
+        // For synchronous IO on the thread pool, it's possible that cancel_io
+        // is called before the IO has actually started. If this is the case,
+        // retry CancelIoEx until it succeeds or the operation finishes.
+    } while (sync && err == ERROR_NOT_FOUND && ol->Internal == STATUS_PENDING &&
+             WaitForSingleObject(ol->hEvent, 1) == WAIT_TIMEOUT);
+    return err != ERROR_NOT_FOUND;
 }
 
 // Wrapper for WriteFile that treats ERROR_IO_PENDING as success
-static DWORD async_write(HANDLE file, const void *buf, unsigned size, OVERLAPPED* ol)
+static DWORD begin_write(HANDLE file, const void *buf, unsigned size, OVERLAPPED* ol)
 {
     DWORD err = WriteFile(file, buf, size, NULL, ol) ? 0 : GetLastError();
     return err == ERROR_IO_PENDING ? 0 : err;
@@ -170,7 +255,7 @@ static DWORD ipc_write_str(struct client_arg *arg, const char *buf)
 {
     DWORD error = 0;
 
-    if ((error = async_write(arg->client_h, buf, strlen(buf), &arg->write_ol)))
+    if ((error = begin_write(arg->client_h, buf, strlen(buf), &arg->write_ol)))
         goto done;
     if (!GetOverlappedResult(arg->client_h, &arg->write_ol, &(DWORD){0}, TRUE)) {
         error = GetLastError();
@@ -199,6 +284,12 @@ static void report_read_error(struct client_arg *arg, DWORD error)
     }
 }
 
+static void wakeup_cb(void *d)
+{
+    HANDLE event = d;
+    SetEvent(event);
+}
+
 static void *client_thread(void *p)
 {
     pthread_detach(pthread_self());
@@ -207,6 +298,7 @@ static void *client_thread(void *p)
     char buf[4096];
     HANDLE wakeup_event = CreateEventW(NULL, TRUE, FALSE, NULL);
     OVERLAPPED ol = { .hEvent = CreateEventW(NULL, TRUE, TRUE, NULL) };
+    int64_t file_ptr = 0;
     bstr client_msg = { talloc_strdup(NULL, ""), 0 };
     DWORD ioerr = 0;
     DWORD r;
@@ -223,8 +315,13 @@ static void *client_thread(void *p)
 
     mpv_set_wakeup_callback(arg->client, wakeup_cb, wakeup_event);
 
+    if (arg->disk_file && arg->sync) {
+        ol.Offset = -2; // FILE_USE_FILE_POINTER_POSITION
+        ol.OffsetHigh = -1;
+    }
+
     // Do the first read operation on the pipe
-    if ((ioerr = async_read(arg->client_h, buf, 4096, &ol))) {
+    if ((ioerr = begin_read(arg->client_h, arg->sync, buf, 4096, &ol))) {
         report_read_error(arg, ioerr);
         goto done;
     }
@@ -278,8 +375,16 @@ static void *client_thread(void *p)
                 talloc_free(reply_msg);
             }
 
+            // Overlapped handles to disk files don't maintain their own file
+            // pointer. It must be updated manually by the caller.
+            if (arg->disk_file && !arg->sync) {
+                file_ptr += r;
+                ol.Offset = file_ptr;
+                ol.OffsetHigh = file_ptr >> 32;
+            }
+
             // Begin the next read operation on the pipe
-            if ((ioerr = async_read(arg->client_h, buf, 4096, &ol))) {
+            if ((ioerr = begin_read(arg->client_h, arg->sync, buf, 4096, &ol))) {
                 report_read_error(arg, ioerr);
                 goto done;
             }
@@ -294,7 +399,7 @@ done:
     if (client_msg.len > 0)
         MP_WARN(arg, "Ignoring unterminated command on disconnect.\n");
 
-    if (CancelIoEx(arg->client_h, &ol) || GetLastError() != ERROR_NOT_FOUND)
+    if (cancel_io(arg->client_h, arg->sync, &ol))
         GetOverlappedResult(arg->client_h, &ol, &(DWORD){0}, TRUE);
     if (wakeup_event)
         CloseHandle(wakeup_event);
@@ -302,8 +407,8 @@ done:
         CloseHandle(ol.hEvent);
     if (arg->write_ol.hEvent)
         CloseHandle(arg->write_ol.hEvent);
-
-    CloseHandle(arg->client_h);
+    if (arg->close_client_h)
+        CloseHandle(arg->client_h);
     mpv_detach_destroy(arg->client);
     talloc_free(arg);
     return NULL;
@@ -328,7 +433,220 @@ static void ipc_start_client_json(struct mp_ipc_ctx *ctx, int id, HANDLE h)
     *client = (struct client_arg){
         .client_name = talloc_asprintf(client, "ipc-%d", id),
         .client_h = h,
+        .close_client_h = true,
         .writable = true,
+    };
+
+    ipc_start_client(ctx, client);
+}
+
+static int ensure_pipe_mode(HANDLE pipe)
+{
+    // Ensure the mode is 0 (PIPE_NOWAIT and PIPE_READMODE_MESSAGE are not set)
+    if (!SetNamedPipeHandleState(pipe, &(DWORD){0}, NULL, NULL)) {
+        switch (GetLastError()) {
+        case ERROR_ACCESS_DENIED:;
+            DWORD m = 0;
+            if (!GetNamedPipeHandleState(pipe, &m, NULL, NULL, NULL, NULL, 0))
+                return -1;
+            // The pipe mode can't be set, so return success depending on
+            // whether it is already correct
+            return m == 0 ? 0 : -1;
+        case ERROR_INVALID_PARAMETER:
+            // The handle is probably not a named pipe. Return success.
+            return 0;
+        default:
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+// Returns true if a handle was opened with FILE_FLAG_OVERLAPPED. There is no
+// public API for this, but there is an Nt* API (libuv also uses this API.) If
+// we can't determine whether the handle is overlapped or not, return false.
+// The non-overlapped code can handle overlapped handles, it will just
+// unnecessarily do reads on the thread pool.
+static bool is_handle_overlapped(HANDLE h)
+{
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    NTSTATUS (NTAPI *pNtQueryInformationFile)(HANDLE, PIO_STATUS_BLOCK, PVOID,
+                                              ULONG, FILE_INFORMATION_CLASS) =
+        (void*)GetProcAddress(ntdll, "NtQueryInformationFile");
+    if (!pNtQueryInformationFile)
+        return false;
+
+    NTSTATUS s;
+    IO_STATUS_BLOCK iosb;
+    FILE_MODE_INFORMATION mi;
+
+    s = pNtQueryInformationFile(h, &iosb, &mi, sizeof mi, FileModeInformation);
+    if (!NT_SUCCESS(s))
+        return false;
+
+    return !(mi.Mode & FILE_SYNCHRONOUS_IO_ALERT) &&
+           !(mi.Mode & FILE_SYNCHRONOUS_IO_NONALERT);
+}
+
+// Open an --input-file from the filesystem. This should use proper retry logic
+// for connecting to multithreaded pipe servers. Sets *writable if the file was
+// opened with write permissions.
+static DWORD open_input_file(wchar_t *name, HANDLE *file, bool *writable)
+{
+    // CreateFileW is kind of broken because the SECURITY_SQOS_PRESENT flag
+    // collides with FILE_FLAG_OPEN_NO_RECALL. Use CreateFile2 if possible.
+    HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+    HANDLE (WINAPI *pCreateFile2)(LPCWSTR, DWORD, DWORD, DWORD,
+        LPCREATEFILE2_EXTENDED_PARAMETERS) =
+        (void*)GetProcAddress(kernel32, "CreateFile2");
+
+    const DWORD r_access = STANDARD_RIGHTS_READ | FILE_READ_DATA | SYNCHRONIZE;
+    // These access rights are somewhat more restrictive than GENERIC_WRITE
+    // because secure pipe servers might not grant clients the
+    // FILE_CREATE_PIPE_INSTANCE right
+    const DWORD rw_access = r_access | STANDARD_RIGHTS_WRITE | FILE_WRITE_DATA;
+    const DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    const DWORD create = OPEN_EXISTING;
+    // Use SECURITY_ANONYMOUS so a pipe server can't impersonate this process
+    const DWORD sqos = SECURITY_ANONYMOUS;
+    const DWORD flags = FILE_FLAG_OVERLAPPED;
+
+    // Try rw_access first. This will be set to r_access if opening fails.
+    DWORD access = rw_access;
+    DWORD err;
+
+    // Return here to retry opening the file. It may be necessary to retry
+    // several times when connecting to a congested pipe server.
+    do {
+        if (pCreateFile2) {
+            *file = pCreateFile2(name, access, share, create,
+                &(CREATEFILE2_EXTENDED_PARAMETERS) {
+                    .dwSize = sizeof(CREATEFILE2_EXTENDED_PARAMETERS),
+                    .dwFileFlags = flags,
+                    .dwSecurityQosFlags = sqos,
+                });
+        } else {
+            *file = CreateFileW(name, access, share, NULL, create,
+                flags | SECURITY_SQOS_PRESENT | sqos, NULL);
+        }
+        if (*file != INVALID_HANDLE_VALUE)
+            break;
+        err = GetLastError();
+
+        // If opening the file for read-write access failed, try read-only
+        if (err == ERROR_ACCESS_DENIED && access == rw_access) {
+            access = r_access;
+            continue;
+        }
+
+        // When opening a named pipe, if all pipe instances are busy, wait for
+        // the default period of time and try again
+        if (err == ERROR_PIPE_BUSY && WaitNamedPipeW(name, 0))
+            continue;
+    } while (0);
+
+    if (*file != INVALID_HANDLE_VALUE) {
+        *writable = access == rw_access;
+        return 0;
+    } else {
+        return err;
+    }
+}
+
+static void ipc_start_client_text(struct mp_ipc_ctx *ctx, const char *path)
+{
+    HANDLE client_h = NULL;
+    bool close_client_h = false;
+    bool sync = true;
+    bool writable = false;
+
+    if (strcmp(path, "/dev/stdin") == 0) {
+        client_h = (HANDLE)_get_osfhandle(STDIN_FILENO);
+        close_client_h = false;
+        sync = true;
+        writable = false;
+    } else if (!strncmp(path, "fd://", 5)) {
+        char *end = NULL;
+        int fd = strtol(path + 5, &end, 0);
+        if (!end || end == path + 5 || end[0]) {
+            MP_ERR(ctx, "Invalid FD: %s\n", path);
+            return;
+        }
+
+        client_h = (HANDLE)_get_osfhandle(fd);
+        close_client_h = false;
+        sync = true;
+        writable = true; // maybe
+    } else if (!strncmp(path, "handle://", 9)) {
+        char *end = NULL;
+        unsigned long long h = strtoull(path + 9, &end, 0);
+        if (!end || end == path + 9 || end[0] || h > UINTPTR_MAX) {
+            MP_ERR(ctx, "Invalid handle: %s\n", path);
+            return;
+        }
+
+        client_h = (HANDLE)(uintptr_t)h;
+        close_client_h = false;
+        sync = !is_handle_overlapped(client_h);
+        writable = true; // maybe
+    } else {
+        wchar_t *wpath = mp_from_utf8(NULL, path);
+        DWORD err = open_input_file(wpath, &client_h, &writable);
+        talloc_free(wpath);
+
+        if (err) {
+            MP_ERR(ctx, "Couldn't open file: %s (%s)\n", path,
+                mp_HRESULT_to_str(HRESULT_FROM_WIN32(err)));
+            return;
+        }
+
+        close_client_h = true;
+        sync = false;
+    }
+
+    if (!client_h || client_h == INVALID_HANDLE_VALUE) {
+        MP_ERR(ctx, "Invalid handle: %s\n", path);
+        return;
+    }
+
+    // FILE_TYPE_UNKNOWN normally indicates an invalid handle
+    DWORD type = GetFileType(client_h);
+    if (!type) {
+        MP_ERR(ctx, "Invalid handle: %s\n", path);
+        return;
+    }
+
+    // Reject pre-Windows 8 consoles because they are not kernel handles
+    if (type == FILE_TYPE_CHAR && !IsWindows8OrGreater() &&
+        GetConsoleMode(client_h, &(DWORD){0}))
+    {
+        CloseHandle(client_h);
+        MP_ERR(ctx, "Console input is not supported\n");
+        return;
+    }
+
+    if (type == FILE_TYPE_PIPE) {
+        // If we didn't create the handle, make sure it has the right mode
+        if (!close_client_h) {
+            if (ensure_pipe_mode(client_h)) {
+                MP_ERR(ctx, "Invalid pipe mode: %s\n", path);
+                return;
+            }
+        }
+    } else {
+        // Don't attempt writing to non-pipes
+        writable = false;
+    }
+
+    struct client_arg *client = talloc_ptrtype(NULL, client);
+    *client = (struct client_arg){
+        .client_name = "input-file",
+        .client_h = client_h,
+        .close_client_h = close_client_h,
+        .writable = writable,
+        .sync = sync,
+        .disk_file = type == FILE_TYPE_DISK,
     };
 
     ipc_start_client(ctx, client);
@@ -456,6 +774,10 @@ struct mp_ipc_ctx *mp_init_ipc(struct mp_client_api *client_api,
         .log = mp_log_new(arg, global->log, "ipc"),
         .client_api = client_api,
     };
+
+    char *input_file = mp_get_user_path(arg, global, opts->input_file);
+    if (input_file && *input_file)
+        ipc_start_client_text(arg, input_file);
 
     if (!opts->ipc_path || !*opts->ipc_path)
         goto out;
