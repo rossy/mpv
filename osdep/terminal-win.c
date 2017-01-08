@@ -277,8 +277,8 @@ bool terminal_try_attach(void)
     if (!AttachConsole(ATTACH_PARENT_PROCESS))
         return false;
 
-    // We have a console window. Redirect output streams to that console's
-    // low-level handles, so things that use printf directly work later on.
+    // We have a console window. Redirect I/O streams to that console's
+    // low-level handles, so things that use stdio directly will work.
     reopen_console_output(STD_OUTPUT_HANDLE, STDOUT_FILENO, stdout);
     reopen_console_output(STD_ERROR_HANDLE, STDERR_FILENO, stderr);
     if (is_a_console(GetStdHandle(STD_INPUT_HANDLE))) {

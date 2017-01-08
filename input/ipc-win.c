@@ -54,7 +54,7 @@ struct client_arg {
     bool close_client_h;
     bool writable;
     bool sync; // The file was not opened in overlapped mode (--input-file only)
-    bool disk_file; // The file is an ordinary disk file with a file pointer
+    bool disk_file; // The file is an ordinary disk file (--input-file only)
     OVERLAPPED write_ol;
 };
 
@@ -156,7 +156,7 @@ struct tp_data {
     OVERLAPPED *ol;
 };
 
-static void tp_read(PTP_CALLBACK_INSTANCE inst, void *ctx)
+static void CALLBACK tp_read(PTP_CALLBACK_INSTANCE inst, void *ctx)
 {
     CallbackMayRunLong(inst);
 
@@ -171,7 +171,7 @@ static void tp_read(PTP_CALLBACK_INSTANCE inst, void *ctx)
         // Convert the Win32 error code to an NTSTATUS. GetOverlappedResult
         // will call SetLastError with this code. Note: The 'Internal' field is
         // not actually internal. It's documented to contain the NTSTATUS code
-        // of the IO operation and other APIs rely on this.
+        // of the IO operation and other public APIs rely on this.
         d.ol->Internal = win32_error_to_nt_status(err);
         // If an IO operation was not started, the event will still be in the
         // non-signaled state. Signal it so the caller can pick up the error.
@@ -577,7 +577,7 @@ static void ipc_start_client_text(struct mp_ipc_ctx *ctx, const char *path)
         client_h = (HANDLE)_get_osfhandle(fd);
         close_client_h = false;
         sync = true;
-        writable = true; // maybe
+        writable = false;
     } else if (!strncmp(path, "handle://", 9)) {
         char *end = NULL;
         unsigned long long h = strtoull(path + 9, &end, 0);
@@ -589,7 +589,7 @@ static void ipc_start_client_text(struct mp_ipc_ctx *ctx, const char *path)
         client_h = (HANDLE)(uintptr_t)h;
         close_client_h = false;
         sync = !is_handle_overlapped(client_h);
-        writable = true; // maybe
+        writable = !sync; // maybe
     } else {
         wchar_t *wpath = mp_from_utf8(NULL, path);
         DWORD err = open_input_file(wpath, &client_h, &writable);
