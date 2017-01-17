@@ -149,9 +149,23 @@ int msync(void *addr, size_t length, int flags);
 #define GLOB_NOMATCH 3
 #endif
 
+#ifndef RTLD_LOCAL
+#define RTLD_LOCAL  0x000
+#define RTLD_LAZY   0x001
+#define RTLD_NOW    0x002
+#define RTLD_GLOBAL 0x100
+#endif
+void *mp_dlopen(const char *file, int mode);
+void *mp_dlsym(void *restrict handle, const char *restrict name);
+int mp_dlclose(void *handle);
+
 #define glob_t mp_glob_t
 #define glob(...) mp_glob(__VA_ARGS__)
 #define globfree(...) mp_globfree(__VA_ARGS__)
+
+#define dlopen(...) mp_dlopen(__VA_ARGS__)
+#define dlsym(...) mp_dlsym(__VA_ARGS__)
+#define dlclose(...) mp_dlclose(__VA_ARGS__)
 
 #else /* __MINGW32__ */
 

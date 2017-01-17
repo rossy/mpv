@@ -488,4 +488,30 @@ int msync(void *addr, size_t length, int flags)
     return 0;
 }
 
+void *mp_dlopen(const char *file, int mode)
+{
+    // Windows doesn't have an equivalent of RTLD_GLOBAL semantics
+    assert((mode & (RTLD_LOCAL | RTLD_GLOBAL)) == RTLD_LOCAL);
+
+    if (file == NULL)
+        return GetModuleHandleW(NULL);
+
+    wchar_t *wfile = mp_from_utf8(NULL, file);
+    void *module = LoadLibraryW(wfile);
+    talloc_free(wfile);
+    return module;
+}
+
+void *mp_dlsym(void *restrict handle, const char *restrict name)
+{
+    return GetProcAddress(handle, name);
+}
+
+int mp_dlclose(void *handle)
+{
+    if (handle)
+        return !FreeLibrary(handle);
+    return 1;
+}
+
 #endif // __MINGW32__

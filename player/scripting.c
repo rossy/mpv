@@ -234,10 +234,24 @@ void mp_load_scripts(struct MPContext *mpctx)
 
 #if HAVE_CPLUGINS
 
-#include <dlfcn.h>
+#define MPV_INIT_FN "mpv_init_cplugin_api"
+typedef void *(*get_proc_address_type)(const char *name);
+typedef int (*mpv_init_cplugin_api)(get_proc_address_type gpa);
 
 #define MPV_DLOPEN_FN "mpv_open_cplugin"
 typedef int (*mpv_open_cplugin)(mpv_handle *handle);
+
+#ifdef __MINGW32__
+EXTERN_C IMAGE_DOS_HEADER __ImageBase;
+#define HINST_THISCOMPONENT ((HINSTANCE)&__ImageBase)
+
+static void *get_proc_address(const char *name)
+{
+    return GetProcAddress(HINST_THISCOMPONENT, name);
+}
+#else
+#include <dlfcn.h>
+#endif
 
 static int load_cplugin(struct mpv_handle *client, const char *fname)
 {
@@ -247,6 +261,19 @@ static int load_cplugin(struct mpv_handle *client, const char *fname)
         goto error;
     // Note: once loaded, we never unload, as unloading the libraries linked to
     //       the plugin can cause random serious problems.
+
+#ifdef __MINGW32__
+    // Windows doesn't have a global symbol table, which makes it hard for the
+    // cplugin to get the addresses of the mpv_* API functions. For this
+    // reason, cplugins on Windows must be linked to a wrapper library that
+    // proxies the API. This function initializes the library.
+    mpv_init_cplugin_api init_fn = (mpv_init_cplugin_api)dlsym(lib, MPV_INIT_FN);
+    if (!init_fn)
+        goto error;
+    if (init_fn(get_proc_address))
+        goto error;
+#endif
+
     mpv_open_cplugin sym = (mpv_open_cplugin)dlsym(lib, MPV_DLOPEN_FN);
     if (!sym)
         goto error;
@@ -256,8 +283,12 @@ error:
 }
 
 const struct mp_scripting mp_scripting_cplugin = {
-    .name = "SO plugin",
+    .name = "C API plugin",
+#ifdef __MINGW32__
+    .file_ext = "dll",
+#else
     .file_ext = "so",
+#endif
     .load = load_cplugin,
 };
 

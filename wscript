@@ -68,16 +68,16 @@ build_options = [
         'desc': 'dynamic loader',
         'func': check_libs(['dl'], check_statement('dlfcn.h', 'dlopen("", 0)'))
     }, {
-        'name': '--cplugins',
-        'desc': 'C plugins',
-        'deps': [ 'libdl' ],
-        'default': 'disable',
-        'func': check_cc(linkflags=['-Wl,-export-dynamic']),
-    }, {
         'name': 'dlopen',
         'desc': 'dlopen',
         'deps_any': [ 'libdl', 'os-win32', 'os-cygwin' ],
         'func': check_true
+    }, {
+        'name': '--cplugins',
+        'desc': 'C plugins',
+        'deps': [ 'dlopen' ],
+        'default': 'disable',
+        'func': check_cc(linkflags=['-Wl,-export-dynamic']),
     }, {
         'name': '--vf-dlopen-filters',
         'desc': 'compilation of default filters for vf_dlopen',
