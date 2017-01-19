@@ -122,7 +122,7 @@ static void d3d_init(struct MPGLContext *ctx)
     HRESULT hr;
     struct priv *p = ctx->priv;
     struct vo *vo = ctx->vo;
-    IDXGIDevice *dxgi_dev = NULL;
+    IDXGIDevice1 *dxgi_dev = NULL;
     IDXGIAdapter *dxgi_adapter = NULL;
     IDXGIAdapter1 *dxgi_adapter1 = NULL;
     IDXGIFactory *dxgi_factory = NULL;
@@ -148,18 +148,20 @@ static void d3d_init(struct MPGLContext *ctx)
     if (eglQueryDeviceAttribEXT(dev, EGL_D3D11_DEVICE_ANGLE, &d3d11_dev_attr)) {
         ID3D11Device *d3d11_dev = (ID3D11Device*)d3d11_dev_attr;
 
-        hr = ID3D11Device_QueryInterface(d3d11_dev, &IID_IDXGIDevice,
+        hr = ID3D11Device_QueryInterface(d3d11_dev, &IID_IDXGIDevice1,
             (void**)&dxgi_dev);
         if (FAILED(hr)) {
-            MP_ERR(vo, "Device is not a IDXGIDevice\n");
+            MP_ERR(vo, "Device is not a IDXGIDevice1\n");
             goto done;
         }
 
-        hr = IDXGIDevice_GetAdapter(dxgi_dev, &dxgi_adapter);
+        hr = IDXGIDevice1_GetAdapter(dxgi_dev, &dxgi_adapter);
         if (FAILED(hr)) {
             MP_ERR(vo, "Couldn't get IDXGIAdapter\n");
             goto done;
         }
+
+        IDXGIDevice1_SetMaximumFrameLatency(dxgi_dev, 1);
 
         // Windows 8 can choose a software adapter even if mpv didn't ask for
         // one. If this is the case, show a warning message.
@@ -198,7 +200,7 @@ static void d3d_init(struct MPGLContext *ctx)
 
 done:
     if (dxgi_dev)
-        IDXGIDevice_Release(dxgi_dev);
+        IDXGIDevice1_Release(dxgi_dev);
     if (dxgi_adapter)
         IDXGIAdapter_Release(dxgi_adapter);
     if (dxgi_adapter1)
