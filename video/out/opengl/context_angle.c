@@ -31,6 +31,8 @@
 #include "osdep/windows_utils.h"
 #include "context.h"
 
+#include "osdep/io.h"
+
 #ifndef EGL_D3D_TEXTURE_ANGLE
 #define EGL_D3D_TEXTURE_ANGLE 0x33A3
 #endif
@@ -818,6 +820,37 @@ static void d3d11_swap_buffers(MPGLContext *ctx)
     HRESULT hr = IDXGISwapChain_Present(p->dxgi_swapchain, p->swapinterval, 0);
     if (FAILED(hr))
         MP_FATAL(ctx->vo, "Couldn't present: %s\n", mp_HRESULT_to_str(hr));
+
+    {
+        LARGE_INTEGER current_qpc;
+        QueryPerformanceCounter(&current_qpc);
+
+        static int fd = -1;
+        static FILE *file = NULL;
+        static LARGE_INTEGER freq;
+        if (fd == -1) {
+            fd = open("stats.csv", _O_CREAT | _O_RDWR | _O_SHORT_LIVED, _S_IREAD | _S_IWRITE);
+            file = fdopen(fd, "w");
+            QueryPerformanceFrequency(&freq);
+            fprintf(file, "Current QPC,QPC Freq,Current PresentCount,stats.PresentCount,stats.PresentRefreshCount,stats.SyncRefreshCount,stats.SyncQPCTime\n");
+        }
+
+        UINT present_count = 0;
+        IDXGISwapChain_GetLastPresentCount(p->dxgi_swapchain, &present_count);
+
+        DXGI_FRAME_STATISTICS stats = { 0 };
+        IDXGISwapChain_GetFrameStatistics(p->dxgi_swapchain, &stats);
+
+        fprintf(file, "%llu,%llu,%u,%u,%u,%u,%llu\n",
+            (long long unsigned)current_qpc.QuadPart,
+            (long long unsigned)freq.QuadPart,
+            (unsigned)present_count,
+            (unsigned)stats.PresentCount,
+            (unsigned)stats.PresentRefreshCount,
+            (unsigned)stats.SyncRefreshCount,
+            (long long unsigned)stats.SyncQPCTime.QuadPart);
+        fflush(file);
+    }
 
     // Restore the RTVs and release the objects
     ID3D11DeviceContext_OMSetRenderTargets(p->d3d11_context,
