@@ -17,6 +17,7 @@
 
 #include <X11/Xlib.h>
 #include <GL/glx.h>
+#include <libavutil/common.h>
 
 #define MP_GET_GLX_WORKAROUNDS
 #include "header_fixes.h"
@@ -308,8 +309,13 @@ static void glx_swap_buffers(struct MPGLContext *ctx)
     GL *gl = ctx->gl;
 
     static int64_t frame_id = 0, ust = 0, msc = 0, sbc = 0;
-    gl->WaitForSbc(vo->x11->display, vo->x11->window, frame_id, &ust, &msc, &sbc);
-    frame_id = gl->SwapBuffersMsc(vo->x11->display, vo->x11->window, msc + 1, 0, 0);
+
+    gl->GetSyncValues(vo->x11->display, vo->x11->window, &ust, &msc, &sbc);
+    int64_t outstanding = FFMAX(frame_id - sbc, 0);
+    int64_t target_msc = msc + outstanding + 1;
+
+    frame_id = gl->SwapBuffersMsc(vo->x11->display, vo->x11->window, target_msc, 0, 0);
+    gl->GetSyncValues(vo->x11->display, vo->x11->window, &ust, &msc, &sbc);
 
 //    printf("%lld,%lld,%lld,%lld\n",
 //        (long long int)frame_id,
