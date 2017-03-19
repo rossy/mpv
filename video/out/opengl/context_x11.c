@@ -304,7 +304,18 @@ static int glx_control(struct MPGLContext *ctx, int *events, int request,
 
 static void glx_swap_buffers(struct MPGLContext *ctx)
 {
-    glXSwapBuffers(ctx->vo->x11->display, ctx->vo->x11->window);
+    struct vo *vo = ctx->vo;
+    GL *gl = ctx->gl;
+
+    static int64_t frame_id = 0, ust = 0, msc = 0, sbc = 0;
+    gl->WaitForSbc(vo->x11->display, vo->x11->window, frame_id, &ust, &msc, &sbc);
+    frame_id = gl->SwapBuffersMsc(vo->x11->display, vo->x11->window, msc + 1, 0, 0);
+
+//    printf("%lld,%lld,%lld,%lld\n",
+//        (long long int)frame_id,
+//        (long long int)ust,
+//        (long long int)msc,
+//        (long long int)sbc);
 }
 
 static void glx_wakeup(struct MPGLContext *ctx)

@@ -31,6 +31,11 @@
 
 #include "video/mp_image.h"
 
+#if HAVE_GL_X11
+#include <X11/Xlib.h>
+#include <GL/glx.h>
+#endif
+
 #if HAVE_GL_COCOA
 #define GL_DO_NOT_WARN_IF_MULTI_GL_VERSION_HEADERS_INCLUDED 1
 #include <OpenGL/gl.h>
@@ -231,6 +236,19 @@ struct GL {
 
     GLint (GLAPIENTRY *GetVideoSync)(GLuint *);
     GLint (GLAPIENTRY *WaitVideoSync)(GLint, GLint, unsigned int *);
+
+#if HAVE_GL_X11
+    Bool (GLAPIENTRY *GetSyncValues)(Display *, GLXDrawable, int64_t *,
+                                     int64_t *, int64_t *);
+    Bool (GLAPIENTRY *GetMscRate)(Display *, GLXDrawable, int32_t *,
+                                  int32_t *);
+    int64_t (GLAPIENTRY *SwapBuffersMsc)(Display *, GLXDrawable, int64_t,
+                                         int64_t, int64_t);
+    Bool (GLAPIENTRY *WaitForMsc)(Display *, GLXDrawable, int64_t, int64_t,
+                                  int64_t, int64_t *, int64_t *, int64_t *);
+    Bool (GLAPIENTRY *WaitForSbc)(Display *, GLXDrawable, int64_t, int64_t *,
+                                  int64_t *, int64_t *);
+#endif
 
     void (GLAPIENTRY *GetTranslatedShaderSourceANGLE)(GLuint, GLsizei,
                                                       GLsizei*, GLchar* source);
