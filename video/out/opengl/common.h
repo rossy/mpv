@@ -46,6 +46,10 @@
 #include <GL/glext.h>
 #endif
 
+#if HAVE_GL_X11
+#include <GL/glx.h>
+#endif
+
 #define MP_GET_GL_WORKAROUNDS
 #include "header_fixes.h"
 
@@ -226,6 +230,19 @@ struct GL {
         HANDLE *hObjects);
     BOOL (GLAPIENTRY *DXUnlockObjectsNV)(HANDLE hDevice, GLint count,
         HANDLE *hObjects);
+#endif
+
+#if HAVE_GL_X11
+    Bool (GLAPIENTRY *GetSyncValues)(Display *, GLXDrawable, int64_t *,
+                                     int64_t *, int64_t *);
+    Bool (GLAPIENTRY *GetMscRate)(Display *, GLXDrawable, int32_t *,
+                                  int32_t *);
+    int64_t (GLAPIENTRY *SwapBuffersMsc)(Display *, GLXDrawable, int64_t,
+                                         int64_t, int64_t);
+    Bool (GLAPIENTRY *WaitForMsc)(Display *, GLXDrawable, int64_t, int64_t,
+                                  int64_t, int64_t *, int64_t *, int64_t *);
+    Bool (GLAPIENTRY *WaitForSbc)(Display *, GLXDrawable, int64_t, int64_t *,
+                                  int64_t *, int64_t *);
 #endif
 
     GLint (GLAPIENTRY *GetVideoSync)(GLuint *);

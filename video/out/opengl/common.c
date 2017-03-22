@@ -340,6 +340,19 @@ static const struct gl_functions gl_functions[] = {
             {0},
         },
     },
+#if HAVE_GL_X11
+    {
+        .extension = "GLX_OML_sync_control",
+        .functions = (const struct gl_function[]) {
+            DEF_FN_NAME(GetSyncValues, "glXGetSyncValuesOML"),
+            DEF_FN_NAME(GetMscRate, "glXGetMscRateOML"),
+            DEF_FN_NAME(SwapBuffersMsc, "glXSwapBuffersMscOML"),
+            DEF_FN_NAME(WaitForMsc, "glXWaitForMscOML"),
+            DEF_FN_NAME(WaitForSbc, "glXWaitForSbcOML"),
+            {0},
+        },
+    },
+#endif
     // For gl_hwdec_vdpau.c
     // http://www.opengl.org/registry/specs/NV/vdpau_interop.txt
     {

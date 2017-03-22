@@ -15,19 +15,37 @@
  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <math.h>
+#include <unistd.h>
+#include <sys/time.h>
+#include <time.h>
 #include <X11/Xlib.h>
 #include <GL/glx.h>
+#include <libavutil/common.h>
 
 #define MP_GET_GLX_WORKAROUNDS
 #include "header_fixes.h"
 
+#include "osdep/timer.h"
 #include "video/out/x11_common.h"
 #include "context.h"
+
+enum ust_type {
+    UST_TYPE_DONTKNOW,
+    UST_TYPE_MONOTONIC,
+    UST_TYPE_REALTIME,
+    UST_TYPE_OTHER,
+};
 
 struct glx_context {
     XVisualInfo *vinfo;
     GLXContext context;
     GLXFBConfig fbc;
+
+    // GLX_OML_sync_control state
+    bool use_glx_oml_sync_control;
+    int64_t last_sbc;
+    enum ust_type ust_type;
 };
 
 static void glx_uninit(MPGLContext *ctx)
@@ -270,6 +288,8 @@ static int glx_init(struct MPGLContext *ctx, int flags)
     if (!success)
         goto uninit;
 
+    glx_ctx->use_glx_oml_sync_control = ctx->gl->SwapBuffersMsc != NULL;
+
     return 0;
 
 uninit:
@@ -304,7 +324,148 @@ static int glx_control(struct MPGLContext *ctx, int *events, int request,
 
 static void glx_swap_buffers(struct MPGLContext *ctx)
 {
-    glXSwapBuffers(ctx->vo->x11->display, ctx->vo->x11->window);
+    struct glx_context *glx_ctx = ctx->priv;
+    struct vo *vo = ctx->vo;
+    GL *gl = ctx->gl;
+
+    if (glx_ctx->use_glx_oml_sync_control) {
+        // Get the UST/MSC/SBC pair for the last frame that was made visible.
+        // This is only possible if mpv has presented at least one frame. On
+        // the first frame, glx_ctx->last_sbc is 0 and target_msc will be set
+        // to 1, so the frame will be presented as soon as possible.
+        int64_t vis_ust = 0, vis_msc = 0, vis_sbc = 0;
+        if (glx_ctx->last_sbc > 0) {
+            gl->WaitForSbc(vo->x11->display, vo->x11->window, 1,
+                           &vis_ust, &vis_msc, &vis_sbc);
+        }
+
+        // Schedule the next frame after any pending frames. This seems to be
+        // the same logic that Mesa uses for scheduling frames presented with
+        // glXSwapBuffers using DRI3/Present, but unlike glXSwapBuffers,
+        // glxSwapBuffersMsc does not perform an implicit glFlush.
+        int64_t pending_frames = FFMAX(glx_ctx->last_sbc - vis_sbc, 0);
+        int64_t target_msc = vis_msc + pending_frames + 1;
+        glx_ctx->last_sbc = gl->SwapBuffersMsc(vo->x11->display,
+                                               vo->x11->window,
+                                               target_msc, 0, 0);
+    } else {
+        glXSwapBuffers(vo->x11->display, vo->x11->window);
+    }
+}
+
+static int64_t get_realtime_clock(void)
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec * 1000000ll + tv.tv_usec;
+}
+
+#if defined(_POSIX_TIMERS) && _POSIX_TIMERS > 0 && defined(CLOCK_MONOTONIC)
+static int64_t get_monotonic_clock(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) < 0)
+        return INT64_MIN;
+    return ts.tv_sec * 1000000ll + ts.tv_nsec / 1000ll;
+}
+#else
+static int64_t get_monotonic_clock(void)
+{
+    return INT64_MIN;
+}
+#endif
+
+static int64_t get_ust(enum ust_type type)
+{
+    if (type == UST_TYPE_MONOTONIC)
+        return get_monotonic_clock();
+    if (type == UST_TYPE_REALTIME)
+        return get_realtime_clock();
+    return INT64_MIN;
+}
+
+static enum ust_type guess_ust_type(int64_t ust)
+{
+    // The GLX_OML_sync_control extension does not specify which system clock
+    // UST timestamps refer to, and on Linux/Mesa it's hard to tell. Apparently
+    // kernel versions before 3.8 use the realtime clock and later versions use
+    // the monotonic clock, so we need to guess which one it really is.
+    if (llabs(ust - get_ust(UST_TYPE_MONOTONIC)) < 10000000ll)
+        return UST_TYPE_MONOTONIC;
+    if (llabs(ust - get_ust(UST_TYPE_REALTIME)) < 10000000ll)
+        return UST_TYPE_REALTIME;
+    return UST_TYPE_OTHER;
+}
+
+static void glx_get_frame_statistics(struct MPGLContext *ctx,
+                                     struct vo_frame_statistics *st)
+{
+    struct glx_context *glx_ctx = ctx->priv;
+    struct vo *vo = ctx->vo;
+    GL *gl = ctx->gl;
+
+    if (!glx_ctx->use_glx_oml_sync_control)
+        return;
+
+    // glXGetMscRateOML is potentially more useful than just using XRandR
+    // because it doesn't require guessing which monitor to synchronize to on a
+    // multi-monitor system
+    int32_t rate_num = 0, rate_denom = 0;
+    int64_t rate_us = 0;
+    if (gl->GetMscRate(vo->x11->display, vo->x11->window,
+                       &rate_num, &rate_denom))
+    {
+        // Apparently glXGetMscRateOML doesn't work on some Mesa systems, so be
+        // paranoid and check that rate_num and rate_denom were set
+        if (rate_num > 0 && rate_denom > 0)
+            rate_us = 1000000ll * rate_denom / rate_num;
+    }
+
+    // Get the current UST/MSC/SBC triple. This should request the data for the
+    // most recent VBlank event from the X server, even if mpv didn't present a
+    // new frame on that event.
+    int64_t sync_ust = 0, sync_msc = 0, sync_sbc = 0;
+    gl->GetSyncValues(vo->x11->display, vo->x11->window,
+                      &sync_ust, &sync_msc, &sync_sbc);
+
+    // If this is the first UST timestamp we've received, guess which system
+    // clock it refers to. See guess_ust_type() for more info.
+    if (sync_ust && glx_ctx->ust_type == UST_TYPE_DONTKNOW) {
+        glx_ctx->ust_type = guess_ust_type(sync_ust);
+        switch (glx_ctx->ust_type) {
+        case UST_TYPE_MONOTONIC:
+            MP_VERBOSE(ctx, "UST timestamps are on the monotonic clock\n");
+            break;
+        case UST_TYPE_REALTIME:
+            MP_VERBOSE(ctx, "UST timestamps are on the realtime clock\n");
+            break;
+        default:
+            MP_VERBOSE(ctx, "UST timestamps are not usable\n");
+        }
+    }
+    if (glx_ctx->ust_type == UST_TYPE_OTHER)
+        return;
+
+    // glXWaitForSbcOML should get a UST/MSC/SBC triple for the last VBlank
+    // event at which mpv presented an actual frame. This might be different to
+    // the triple returned by glXGetSyncValuesOML if mpv didn't present a frame
+    // on the most recent VBlank event.
+    int64_t vis_ust = 0, vis_msc = 0, vis_sbc = 0;
+    if (sync_sbc) {
+        gl->WaitForSbc(vo->x11->display, vo->x11->window, sync_sbc,
+                       &vis_ust, &vis_msc, &vis_sbc);
+    }
+
+    int64_t cur_ust = get_ust(glx_ctx->ust_type);
+    int64_t cur_mp_time = mp_time_us();
+
+    st->most_recent_frame_id = glx_ctx->last_sbc;
+    st->hw_visible_frame_id = vis_sbc;
+    st->hw_visible_frame_time_us = vis_ust - cur_ust + cur_mp_time;
+    st->hw_visible_frame_vsync_count = vis_msc;
+    st->hw_last_vsync_count = sync_msc;
+    st->hw_last_vsync_time_us = sync_ust - cur_ust + cur_mp_time;
+    st->nominal_vsync_duration_us = rate_us;
 }
 
 static void glx_wakeup(struct MPGLContext *ctx)
@@ -318,25 +479,27 @@ static void glx_wait_events(struct MPGLContext *ctx, int64_t until_time_us)
 }
 
 const struct mpgl_driver mpgl_driver_x11 = {
-    .name           = "x11",
-    .priv_size      = sizeof(struct glx_context),
-    .init           = glx_init,
-    .reconfig       = glx_reconfig,
-    .swap_buffers   = glx_swap_buffers,
-    .control        = glx_control,
-    .wakeup         = glx_wakeup,
-    .wait_events    = glx_wait_events,
-    .uninit         = glx_uninit,
+    .name                 = "x11",
+    .priv_size            = sizeof(struct glx_context),
+    .init                 = glx_init,
+    .reconfig             = glx_reconfig,
+    .swap_buffers         = glx_swap_buffers,
+    .get_frame_statistics = glx_get_frame_statistics,
+    .control              = glx_control,
+    .wakeup               = glx_wakeup,
+    .wait_events          = glx_wait_events,
+    .uninit               = glx_uninit,
 };
 
 const struct mpgl_driver mpgl_driver_x11_probe = {
-    .name           = "x11probe",
-    .priv_size      = sizeof(struct glx_context),
-    .init           = glx_init_probe,
-    .reconfig       = glx_reconfig,
-    .swap_buffers   = glx_swap_buffers,
-    .control        = glx_control,
-    .wakeup         = glx_wakeup,
-    .wait_events    = glx_wait_events,
-    .uninit         = glx_uninit,
+    .name                 = "x11probe",
+    .priv_size            = sizeof(struct glx_context),
+    .init                 = glx_init_probe,
+    .reconfig             = glx_reconfig,
+    .swap_buffers         = glx_swap_buffers,
+    .get_frame_statistics = glx_get_frame_statistics,
+    .control              = glx_control,
+    .wakeup               = glx_wakeup,
+    .wait_events          = glx_wait_events,
+    .uninit               = glx_uninit,
 };
