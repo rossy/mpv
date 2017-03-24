@@ -28,6 +28,7 @@
 #include "common/common.h"
 #include "options/m_config.h"
 #include "video/out/w32_common.h"
+#include "osdep/timer.h"
 #include "osdep/windows_utils.h"
 #include "context.h"
 
@@ -833,7 +834,7 @@ static void egl_swap_buffers(MPGLContext *ctx)
     eglSwapBuffers(p->egl_display, p->egl_window);
 }
 
-static void angle_swap_buffers(MPGLContext *ctx)
+static void angle_swap_buffers(struct MPGLContext *ctx)
 {
     struct priv *p = ctx->priv;
     if (p->dxgi_swapchain)
@@ -842,12 +843,59 @@ static void angle_swap_buffers(MPGLContext *ctx)
         egl_swap_buffers(ctx);
 }
 
+static int64_t qpc_to_usecs(int64_t qpc)
+{
+    static LARGE_INTEGER perf_freq;
+    if (!perf_freq.QuadPart)
+        QueryPerformanceFrequency(&perf_freq);
+
+    return qpc / perf_freq.QuadPart * 1000000 +
+        qpc % perf_freq.QuadPart * 1000000 / perf_freq.QuadPart;
+}
+
+static void angle_get_frame_statistics(struct MPGLContext *ctx,
+                                       struct vo_frame_statistics *st)
+{
+    struct priv *p = ctx->priv;
+    HRESULT hr;
+
+    if (!p->dxgi_swapchain)
+        return;
+
+    UINT present_count;
+    hr = IDXGISwapChain_GetLastPresentCount(p->dxgi_swapchain, &present_count);
+    if (FAILED(hr))
+        return;
+
+    DXGI_FRAME_STATISTICS fs;
+    hr = IDXGISwapChain_GetFrameStatistics(p->dxgi_swapchain, &fs);
+    if (FAILED(hr))
+        return;
+
+    if (fs.PresentRefreshCount != fs.SyncRefreshCount)
+        return;
+
+    LARGE_INTEGER perf_count;
+    QueryPerformanceCounter(&perf_count);
+    int64_t cur_mp_time = mp_time_us();
+    int64_t sync_qpc_us = qpc_to_usecs(fs.SyncQPCTime.QuadPart);
+    int64_t cur_qpc_us = qpc_to_usecs(perf_count.QuadPart);
+
+    st->most_recent_frame_id = present_count;
+    st->hw_visible_frame_id = fs.PresentCount;
+    st->hw_visible_frame_time_us = sync_qpc_us - cur_qpc_us + cur_mp_time;
+    st->hw_visible_frame_vsync_count = fs.PresentRefreshCount;
+    st->hw_last_vsync_count = fs.SyncRefreshCount;
+    st->hw_last_vsync_time_us = sync_qpc_us - cur_qpc_us + cur_mp_time;
+}
+
 const struct mpgl_driver mpgl_driver_angle = {
-    .name           = "angle",
-    .priv_size      = sizeof(struct priv),
-    .init           = angle_init,
-    .reconfig       = angle_reconfig,
-    .swap_buffers   = angle_swap_buffers,
-    .control        = angle_control,
-    .uninit         = angle_uninit,
+    .name                 = "angle",
+    .priv_size            = sizeof(struct priv),
+    .init                 = angle_init,
+    .reconfig             = angle_reconfig,
+    .swap_buffers         = angle_swap_buffers,
+    .get_frame_statistics = angle_get_frame_statistics,
+    .control              = angle_control,
+    .uninit               = angle_uninit,
 };
