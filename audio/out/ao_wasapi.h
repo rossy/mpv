@@ -24,6 +24,7 @@
 #include <stdbool.h>
 #include <windows.h>
 #include <mmdeviceapi.h>
+#include <mmdeviceapi-extra.h>
 #include <audioclient.h>
 #include <audiopolicy.h>
 #include <endpointvolume.h>
@@ -118,5 +119,9 @@ void wasapi_thread_uninit(struct ao *ao);
 
 void wasapi_receive_proxies(wasapi_state *state);
 void wasapi_release_proxies(wasapi_state *state);
+
+HRESULT wasapi_activate_audio_interface(const wchar_t *device,
+                                        PROPVARIANT *params,
+                                        IAudioClient **aclient);
 
 #endif

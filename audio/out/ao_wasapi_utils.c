@@ -924,43 +924,29 @@ HRESULT wasapi_thread_init(struct ao *ao)
     bool align_hack = false;
     HRESULT hr;
 retry: ;
-    if (state->deviceID) {
-        hr = load_device(ao->log, &state->pDevice, state->deviceID);
+//    if (state->deviceID) {
+//        hr = load_device(ao->log, &state->pDevice, state->deviceID);
+//        EXIT_ON_ERROR(hr);
+//
+//        MP_DBG(ao, "Activating pAudioClient interface\n");
+//        hr = IMMDeviceActivator_Activate(state->pDevice, &IID_IAudioClient,
+//                                        CLSCTX_ALL, NULL,
+//                                        (void **)&state->pAudioClient);
+//        EXIT_ON_ERROR(hr);
+//    } else {
+        MP_VERBOSE(ao, "Trying Windows 8+ audio client activation\n");
+
+        // DEVINTERFACE_AUDIO_RENDER is the default render device. Apparently
+        // this supports automatic stream routing in the Anniversary update.
+        LPOLESTR device_guid;
+        hr = StringFromIID(&DEVINTERFACE_AUDIO_RENDER, &device_guid);
         EXIT_ON_ERROR(hr);
 
-        MP_DBG(ao, "Activating pAudioClient interface\n");
-        hr = IMMDeviceActivator_Activate(state->pDevice, &IID_IAudioClient,
-                                        CLSCTX_ALL, NULL,
-                                        (void **)&state->pAudioClient);
+        hr = wasapi_activate_audio_interface(device_guid, NULL,
+                                             &state->pAudioClient);
+        CoTaskMemFree(device_guid);
         EXIT_ON_ERROR(hr);
-    } else {
-        MP_VERBOSE(ao, "Trying UWP wrapper.\n");
-
-        HRESULT (*wuCreateDefaultAudioRenderer)(IUnknown **res) = NULL;
-        HANDLE lib = LoadLibraryW(L"wasapiuwp2.dll");
-        if (!lib) {
-            MP_ERR(ao, "Wrapper not found: %d\n", (int)GetLastError());
-            hr = E_FAIL;
-            EXIT_ON_ERROR(hr);
-        }
-        if (lib) {
-            wuCreateDefaultAudioRenderer =
-                (void*)GetProcAddress(lib, "wuCreateDefaultAudioRenderer");
-        }
-        if (!wuCreateDefaultAudioRenderer) {
-            MP_ERR(ao, "Function not found.\n");
-            hr = E_FAIL;
-            EXIT_ON_ERROR(hr);
-        }
-        IUnknown *res = NULL;
-        hr = wuCreateDefaultAudioRenderer(&res);
-        MP_VERBOSE(ao, "Device: %s %p\n", mp_HRESULT_to_str(hr), res);
-        EXIT_ON_ERROR(hr);
-        hr = IUnknown_QueryInterface(res, &IID_IAudioClient,
-                                     (void **)&state->pAudioClient);
-        IUnknown_Release(res);
-        EXIT_ON_ERROR(hr);
-    }
+//    }
 
     MP_DBG(ao, "Probing formats\n");
     if (!find_formats(ao)) {

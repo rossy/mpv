@@ -1,0 +1,42 @@
+import "unknwn.idl";
+import "propsys.idl";
+
+[
+    object,
+    local,
+    uuid(72a22d78-cde4-431d-b8cc-843a71199b6d),
+    nonextensible,
+    pointer_default(unique)
+]
+interface IActivateAudioInterfaceAsyncOperation : IUnknown
+{
+    [id(1)] HRESULT GetActivateResult(
+        [out] HRESULT *activateResult,
+        [out] IUnknown **activatedInterface
+    );
+}
+
+[
+    object,
+    local,
+    uuid(41d949ab-9862-444a-80f6-c261334da5eb),
+    nonextensible,
+    pointer_default(unique)
+]
+interface IActivateAudioInterfaceCompletionHandler : IUnknown
+{
+    [id(1)] HRESULT ActivateCompleted(
+        [in] IActivateAudioInterfaceAsyncOperation *activateOperation
+    );
+}
+
+cpp_quote("DEFINE_GUID(DEVINTERFACE_AUDIO_RENDER, 0xe6327cad, 0xdcec, 0x4949, 0xae, 0x8a, 0x99, 0x1e, 0x97, 0x6a, 0x79, 0xd2);")
+cpp_quote("DEFINE_GUID(DEVINTERFACE_AUDIO_CAPTURE, 0x2eef81be, 0x33fa, 0x4800, 0x96, 0x70, 0x1c, 0xd4, 0x74, 0x97, 0x2c, 0x3f);")
+
+cpp_quote("HRESULT WINAPI ActivateAudioInterfaceAsync(")
+cpp_quote("    LPCWSTR deviceInterfacePath,")
+cpp_quote("    REFIID riid,")
+cpp_quote("    PROPVARIANT *activationParams,")
+cpp_quote("    IActivateAudioInterfaceCompletionHandler *completionHandler,")
+cpp_quote("    IActivateAudioInterfaceAsyncOperation **createAsync")
+cpp_quote(");")
