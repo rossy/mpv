@@ -811,6 +811,11 @@ static void reinit_window_state(struct vo_w32_state *w32)
         }
     }
 
+    if (w32->current_fs && w32->opts->exclusive) {
+        // The OpenGL backend will be responsible for repositioning the window
+        return;
+    }
+
     r.left = w32->window_x;
     r.right = r.left + w32->dw;
     r.top = w32->window_y;

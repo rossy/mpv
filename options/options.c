@@ -144,6 +144,7 @@ static const m_option_t mp_vo_opt_list[] = {
     OPT_FLOATRANGE("monitoraspect", force_monitor_aspect, 0, 0.0, 9.0),
     OPT_FLOATRANGE("monitorpixelaspect", monitor_pixel_aspect, 0, 0.2, 9.0),
     OPT_FLAG("fullscreen", fullscreen, 0),
+    OPT_FLAG("video-exclusive", exclusive, 0),
     OPT_ALIAS("fs", "fullscreen"),
     OPT_FLAG("native-keyrepeat", native_keyrepeat, 0),
     OPT_FLOATRANGE("panscan", panscan, UPDATE_VIDEOPOS, 0.0, 1.0),

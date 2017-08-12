@@ -367,6 +367,8 @@ static bool d3d11_device_create(MPGLContext *ctx, int flags)
 static void d3d11_swapchain_surface_destroy(MPGLContext *ctx)
 {
     struct priv *p = ctx->priv;
+    if (p->dxgi_swapchain)
+        IDXGISwapChain_SetFullscreenState(p->dxgi_swapchain, FALSE, NULL);
     SAFE_RELEASE(p->dxgi_swapchain);
     SAFE_RELEASE(p->dxgi_swapchain1);
     d3d11_backbuffer_release(ctx);
@@ -825,6 +827,28 @@ done:
     return img;
 }
 
+static bool d3d11_set_fullscreen(MPGLContext *ctx)
+{
+    struct priv *p = ctx->priv;
+    struct vo *vo = ctx->vo;
+    HRESULT hr;
+
+    hr = IDXGISwapChain_SetFullscreenState(p->dxgi_swapchain,
+                                           ctx->vo->opts->fullscreen, NULL);
+    if (FAILED(hr))
+        return false;
+
+    d3d11_backbuffer_resize(ctx);
+
+    if (ctx->vo->opts->fullscreen) {
+        MP_VERBOSE(vo, "Entered full-screen exclusive mode\n");
+    } else {
+        MP_VERBOSE(vo, "Left full-screen exclusive mode\n");
+    }
+
+    return true;
+}
+
 static int angle_control(MPGLContext *ctx, int *events, int request, void *arg)
 {
     struct priv *p = ctx->priv;
@@ -834,11 +858,17 @@ static int angle_control(MPGLContext *ctx, int *events, int request, void *arg)
         struct mp_image *img = d3d11_screenshot(ctx);
         if (img) {
             *(struct mp_image **)arg = img;
-            return true;
+            return VO_TRUE;
         }
     }
 
     int r = vo_w32_control(ctx->vo, events, request, arg);
+    if (request == VOCTRL_FULLSCREEN && p->dxgi_swapchain &&
+        ctx->vo->opts->exclusive)
+    {
+        if (!d3d11_set_fullscreen(ctx))
+            return VO_FALSE;
+    }
     if (*events & VO_EVENT_RESIZE) {
         if (p->dxgi_swapchain)
             d3d11_backbuffer_resize(ctx);
