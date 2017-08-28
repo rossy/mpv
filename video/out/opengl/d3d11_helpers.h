@@ -23,6 +23,8 @@
 #include <d3d11.h>
 #include <dxgi1_2.h>
 
+#include "common/msg.h"
+
 struct d3d11_device_opts {
     // Allow a software (WARP) adapter. Note, sometimes a software adapter will
     // be used even when allow_warp is false. This is because, on Windows 8 and

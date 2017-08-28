@@ -642,7 +642,8 @@ video_output_features = [
         'groups': [ 'gl' ],
         'func': compose_checks(
             check_statement(['GL/gl.h', 'GL/wglext.h'], 'int i = WGL_ACCESS_WRITE_DISCARD_NV'),
-            check_statement('d3d9.h', 'IDirect3D9Ex *d'))
+            check_statement('d3d9.h', 'IDirect3D9Ex *d'),
+            check_statement('d3d11.h', 'ID3D11Device *d'))
     } , {
         'name': '--egl-angle',
         'desc': 'OpenGL ANGLE headers',

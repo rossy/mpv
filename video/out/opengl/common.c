@@ -431,6 +431,10 @@ static const struct gl_functions gl_functions[] = {
             {0}
         },
     },
+    {
+        .extension = "WGL_NV_DX_interop2",
+        .provides = MPGL_CAP_DXINTEROP2,
+    },
 #endif
     // Apple Packed YUV Formats
     // For gl_hwdec_vda.c

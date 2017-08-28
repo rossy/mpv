@@ -88,6 +88,7 @@ extern const struct m_obj_list vo_obj_list;
 extern const struct m_obj_list ao_obj_list;
 
 extern const struct m_sub_options angle_conf;
+extern const struct m_sub_options dxinterop_conf;
 extern const struct m_sub_options cocoa_conf;
 
 const struct m_opt_choice_alternatives mp_hwdec_names[] = {
@@ -692,6 +693,10 @@ const m_option_t mp_opts[] = {
 
 #if HAVE_EGL_ANGLE_WIN32
     OPT_SUBSTRUCT("", angle_opts, angle_conf, 0),
+#endif
+
+#if HAVE_GL_DXINTEROP
+    OPT_SUBSTRUCT("", dxinterop_opts, dxinterop_conf, 0),
 #endif
 
 #if HAVE_GL_COCOA
