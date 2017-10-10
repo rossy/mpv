@@ -804,7 +804,7 @@ video_output_features = [
     }, {
         'name': '--vulkan',
         'desc':  'Vulkan context support',
-        'func': check_cc(header_name='vulkan/vulkan.h', lib='vulkan'),
+        'func': check_pkg_config('vulkan', '>= 1.0'),
     }, {
         'name': '--shaderc',
         'desc': 'libshaderc SPIR-V compiler',
