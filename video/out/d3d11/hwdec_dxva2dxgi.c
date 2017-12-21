@@ -27,10 +27,15 @@
 #include "video/out/d3d11/ra_d3d11.h"
 #include "video/out/gpu/hwdec.h"
 
+// Missing mingw-w64 definition
+#define DXVA2_VPDev_HardwareDevice (0x1)
+
 struct priv_owner {
     struct mp_hwdec_ctx hwctx;
     ID3D11Device *dev11;
     IDirect3DDevice9Ex *dev9;
+    IDirectXVideoProcessorService *vp_srv;
+    bool supports_stretchrect;
 };
 
 struct queue_surf {
@@ -50,6 +55,14 @@ struct priv {
     ID3D11DeviceContext *ctx11;
     IDirect3DDevice9Ex *dev9;
 
+    // Video processor stuff
+    IDirectXVideoProcessor *vp;
+    DXVA2_ExtendedFormat extfmt;
+    DXVA2_ValueRange brightness_range;
+    DXVA2_ValueRange contrast_range;
+    DXVA2_ValueRange hue_range;
+    DXVA2_ValueRange saturation_range;
+
     // Surface queue stuff. Following Microsoft recommendations, a queue of
     // surfaces is used to share images between D3D9 and D3D11. This allows
     // multiple D3D11 frames to be in-flight at once.
@@ -63,8 +76,29 @@ static void uninit(struct ra_hwdec *hw)
     struct priv_owner *p = hw->priv;
     hwdec_devices_remove(hw->devs, &p->hwctx);
     av_buffer_unref(&p->hwctx.av_device_ref);
+    SAFE_RELEASE(p->vp_srv);
     SAFE_RELEASE(p->dev11);
     SAFE_RELEASE(p->dev9);
+}
+
+static bool create_vp_service(struct ra_hwdec *hw)
+{
+    struct priv_owner *p = hw->priv;
+    HRESULT hr;
+
+    HRESULT (WINAPI *DXVA2CreateVideoService)(IDirect3DDevice9 *pDD,
+        REFIID riid, void **ppService);
+    DXVA2CreateVideoService =
+        (void *)GetProcAddress(dxva2_dll, "DXVA2CreateVideoService");
+    if (!DXVA2CreateVideoService)
+        return false;
+
+    hr = DXVA2CreateVideoService((IDirect3DDevice9 *)p->dev9,
+        &IID_IDirectXVideoProcessorService, (void **)&p->vp_srv);
+    if (FAILED(hr))
+        return false;
+
+    return true;
 }
 
 static int init(struct ra_hwdec *hw)
@@ -126,9 +160,16 @@ static int init(struct ra_hwdec *hw)
     // Check if it's possible to StretchRect() from NV12 to XRGB surfaces
     hr = IDirect3D9Ex_CheckDeviceFormatConversion(d3d9ex, D3DADAPTER_DEFAULT,
         D3DDEVTYPE_HAL, MAKEFOURCC('N', 'V', '1', '2'), D3DFMT_X8R8G8B8);
-    if (hr != S_OK) {
-        MP_FATAL(hw, "Can't StretchRect from NV12 to XRGB surfaces\n");
-        goto done;
+    p->supports_stretchrect = hr == D3D_OK;
+
+    if (!create_vp_service(hw)) {
+        int msgl = p->supports_stretchrect ? MSGL_V : MSGL_FATAL;
+        mp_msg(hw->log, msgl, "Failed to create video processor service\n");
+
+        // If the video processor doesn't work and StretchRect isn't supported,
+        // there is no way to convert YUV->RGB in hardware
+        if (!p->supports_stretchrect)
+            goto done;
     }
 
     p->hwctx = (struct mp_hwdec_ctx){
@@ -143,6 +184,118 @@ done:
     return ret;
 }
 
+static DXVA2_VideoChromaSubSampling mp_to_dxva_loc(enum mp_chroma_location loc)
+{
+    if (loc == MP_CHROMA_CENTER)
+        return DXVA2_VideoChromaSubsampling_MPEG1;
+    return DXVA2_VideoChromaSubsampling_MPEG2;
+}
+
+static DXVA2_NominalRange mp_to_dxva_range(enum mp_csp_levels range)
+{
+    if (range == MP_CSP_LEVELS_PC)
+        return DXVA2_NominalRange_0_255;
+    return DXVA2_NominalRange_16_235;
+}
+
+static DXVA2_VideoTransferMatrix mp_to_dxva_space(enum mp_csp colorspace)
+{
+    switch (colorspace) {
+    default:                return DXVA2_VideoTransferMatrix_BT709;
+    case MP_CSP_BT_601:     return DXVA2_VideoTransferMatrix_BT601;
+    case MP_CSP_SMPTE_240M: return DXVA2_VideoTransferMatrix_SMPTE240M;
+    }
+}
+
+static DXVA2_ExtendedFormat mp_to_dxva_extfmt(struct mp_image_params *params)
+{
+    // It's unclear which of these properties drivers actually understand
+    return (DXVA2_ExtendedFormat){
+        .SampleFormat = DXVA2_SampleProgressiveFrame,
+        .VideoChromaSubsampling = mp_to_dxva_loc(params->chroma_location),
+        .NominalRange = mp_to_dxva_range(params->color.levels),
+        .VideoTransferMatrix = mp_to_dxva_space(params->color.space),
+    };
+}
+
+static bool vp_init(struct ra_hwdec_mapper *mapper)
+{
+    struct priv_owner *o = mapper->owner->priv;
+    struct priv *p = mapper->priv;
+    GUID *vp_devices = NULL;
+    bool success = false;
+    HRESULT hr;
+
+    if (!o->vp_srv)
+        return false;
+
+    p->extfmt = mp_to_dxva_extfmt(&mapper->src_params);
+    DXVA2_VideoDesc vad = {
+        .SampleWidth = mapper->src_params.w,
+        .SampleHeight = mapper->src_params.h,
+        .SampleFormat = p->extfmt,
+        .Format = MAKEFOURCC('N', 'V', '1', '2'),
+    };
+
+    UINT count;
+    hr = IDirectXVideoProcessorService_GetVideoProcessorDeviceGuids(o->vp_srv,
+        &vad, &count, &vp_devices);
+    if (FAILED(hr)) {
+        MP_ERR(mapper, "Could not get video processors: %s\n",
+               mp_HRESULT_to_str(hr));
+        goto done;
+    }
+
+    // Try to find a hardware video processor that can do YUV->RGB conversion
+    GUID *dev;
+    bool found = false;
+    for (UINT i = 0; i < count; i++) {
+        dev = &vp_devices[0];
+        DXVA2_VideoProcessorCaps caps;
+        hr = IDirectXVideoProcessorService_GetVideoProcessorCaps(o->vp_srv,
+            dev, &vad, D3DFMT_X8R8G8B8, &caps);
+        if (FAILED(hr))
+            continue;
+
+        if (!(caps.DeviceCaps & DXVA2_VPDev_HardwareDevice))
+            continue;
+        if (!(caps.VideoProcessorOperations & DXVA2_VideoProcess_YUV2RGB))
+            continue;
+
+        hr = IDirectXVideoProcessorService_CreateVideoProcessor(o->vp_srv,
+            &vp_devices[0], &vad, D3DFMT_X8R8G8B8, 0, &p->vp);
+        if (FAILED(hr)) {
+            MP_VERBOSE(mapper, "Failed to create video processor %s: %s\n",
+                       mp_GUID_to_str(dev), mp_HRESULT_to_str(hr));
+            continue;
+        }
+
+        found = true;
+        break;
+    }
+    if (!found) {
+        MP_VERBOSE(mapper, "Could not find suitable video processor\n");
+        goto done;
+    }
+
+    // We don't use the ProcAmp controls, but we still have to fetch the
+    // DefaultValues for VideoProcessBlt()
+    IDirectXVideoProcessorService_GetProcAmpRange(o->vp_srv, dev, &vad,
+        D3DFMT_X8R8G8B8, DXVA2_ProcAmp_Brightness, &p->brightness_range);
+    IDirectXVideoProcessorService_GetProcAmpRange(o->vp_srv, dev, &vad,
+        D3DFMT_X8R8G8B8, DXVA2_ProcAmp_Contrast, &p->contrast_range);
+    IDirectXVideoProcessorService_GetProcAmpRange(o->vp_srv, dev, &vad,
+        D3DFMT_X8R8G8B8, DXVA2_ProcAmp_Hue, &p->hue_range);
+    IDirectXVideoProcessorService_GetProcAmpRange(o->vp_srv, dev, &vad,
+        D3DFMT_X8R8G8B8, DXVA2_ProcAmp_Saturation, &p->saturation_range);
+
+    success = true;
+done:
+    if (vp_devices)
+        CoTaskMemFree(vp_devices);
+    return success;
+}
+
 static int mapper_init(struct ra_hwdec_mapper *mapper)
 {
     struct priv_owner *o = mapper->owner->priv;
@@ -151,6 +304,15 @@ static int mapper_init(struct ra_hwdec_mapper *mapper)
     p->dev11 = o->dev11;
     p->dev9 = o->dev9;
     ID3D11Device_GetImmediateContext(o->dev11, &p->ctx11);
+
+    if (vp_init(mapper)) {
+        MP_VERBOSE(mapper, "Using video processor for conversion\n");
+    } else if (o->supports_stretchrect) {
+        MP_VERBOSE(mapper, "Using StretchRect for conversion\n");
+    } else {
+        MP_ERR(mapper, "No conversion method available\n");
+        return -1;
+    }
 
     mapper->dst_params = mapper->src_params;
     mapper->dst_params.imgfmt = IMGFMT_RGB0;
@@ -409,6 +571,7 @@ static void mapper_uninit(struct ra_hwdec_mapper *mapper)
 
     for (int i = 0; i < p->queue_len; i++)
         surf_destroy(mapper, p->queue[i]);
+    SAFE_RELEASE(p->vp);
 }
 
 static int mapper_map(struct ra_hwdec_mapper *mapper)
@@ -423,11 +586,45 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
     RECT rc = {0, 0, mapper->src->w, mapper->src->h};
     IDirect3DSurface9* hw_surface = (IDirect3DSurface9 *)mapper->src->planes[3];
 
-    hr = IDirect3DDevice9Ex_StretchRect(p->dev9, hw_surface, &rc, surf->surf9,
-                                        &rc, D3DTEXF_NONE);
-    if (FAILED(hr)) {
-        MP_ERR(mapper, "StretchRect() failed: %s\n", mp_HRESULT_to_str(hr));
-        return -1;
+    if (p->vp) {
+        DXVA2_VideoProcessBltParams bp = {
+            .TargetRect = rc,
+            .BackgroundColor.Alpha = 0xffff,
+            .DestFormat = {
+                .SampleFormat = DXVA2_SampleProgressiveFrame,
+                .NominalRange = DXVA2_NominalRange_0_255,
+            },
+            .ProcAmpValues = {
+                .Brightness = p->brightness_range.DefaultValue,
+                .Contrast = p->contrast_range.DefaultValue,
+                .Hue = p->hue_range.DefaultValue,
+                .Saturation = p->saturation_range.DefaultValue,
+            },
+            .Alpha = DXVA2_Fixed32OpaqueAlpha(),
+        };
+
+        DXVA2_VideoSample sample = {
+            .SampleFormat = p->extfmt,
+            .SrcSurface = hw_surface,
+            .SrcRect = rc,
+            .DstRect = rc,
+            .PlanarAlpha = DXVA2_Fixed32OpaqueAlpha(),
+        };
+
+        hr = IDirectXVideoProcessor_VideoProcessBlt(p->vp, surf->surf9, &bp,
+                                                    &sample, 1, NULL);
+        if (FAILED(hr)) {
+            MP_ERR(mapper, "VideoProcessBlt() failed: %s\n",
+                   mp_HRESULT_to_str(hr));
+            return -1;
+        }
+    } else {
+        hr = IDirect3DDevice9Ex_StretchRect(p->dev9, hw_surface, &rc, surf->surf9,
+                                            &rc, D3DTEXF_NONE);
+        if (FAILED(hr)) {
+            MP_ERR(mapper, "StretchRect() failed: %s\n", mp_HRESULT_to_str(hr));
+            return -1;
+        }
     }
 
     if (!surf_wait_idle9(mapper, surf))
