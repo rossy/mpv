@@ -30,6 +30,8 @@ struct d3d11_opts {
     int warp;
     int flip;
     int sync_interval;
+    int colorspace;
+    int format;
 };
 
 #define OPT_BASE_STRUCT struct d3d11_opts
@@ -49,6 +51,16 @@ const struct m_sub_options d3d11_conf = {
                     {"9_3", D3D_FEATURE_LEVEL_9_3},
                     {"9_2", D3D_FEATURE_LEVEL_9_2},
                     {"9_1", D3D_FEATURE_LEVEL_9_1})),
+        OPT_CHOICE("d3d11-colorspace", colorspace, 0,
+                   ({"srgb", DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709},
+                    {"linear", DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709},
+                    {"hdr", DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020},
+                    {"bt.2020", DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P2020})),
+        OPT_CHOICE("d3d11-format", format, 0,
+                   ({"rgba16f", DXGI_FORMAT_R16G16B16A16_FLOAT},
+                    {"rgb10_a2", DXGI_FORMAT_R10G10B10A2_UNORM},
+                    {"rgba8", DXGI_FORMAT_R8G8B8A8_UNORM},
+                    {"brga8", DXGI_FORMAT_B8G8R8A8_UNORM})),
         OPT_FLAG("d3d11-flip", flip, 0),
         OPT_INTRANGE("d3d11-sync-interval", sync_interval, 0, 0, 4),
         {0}
@@ -125,7 +137,12 @@ static bool d3d11_reconfig(struct ra_ctx *ctx)
 
 static int d3d11_color_depth(struct ra_swapchain *sw)
 {
-    return 8;
+    struct priv *p = sw->ctx->priv;
+    if (!p->backbuffer)
+        return 8;
+    if (p->backbuffer->params.format->component_depth[0])
+        return p->backbuffer->params.format->component_depth[0];
+    return p->backbuffer->params.format->component_size[0];
 }
 
 static bool d3d11_start_frame(struct ra_swapchain *sw, struct ra_fbo *out_fbo)
@@ -216,6 +233,8 @@ static bool d3d11_init(struct ra_ctx *ctx)
         .window = vo_w32_hwnd(ctx->vo),
         .width = ctx->vo->dwidth,
         .height = ctx->vo->dheight,
+        .format = p->opts->format,
+        .colorspace = p->opts->colorspace,
         .flip = p->opts->flip,
         // Add one frame for the backbuffer and one frame of "slack" to reduce
         // contention with the window manager when acquiring the backbuffer

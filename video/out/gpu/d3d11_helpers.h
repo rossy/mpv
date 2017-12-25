@@ -62,6 +62,8 @@ struct d3d11_swapchain_opts {
     HWND window;
     int width;
     int height;
+    DXGI_FORMAT format;
+    DXGI_COLOR_SPACE_TYPE colorspace;
 
     // Use DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL if possible
     bool flip;

@@ -17,7 +17,7 @@
 
 #include <windows.h>
 #include <d3d11.h>
-#include <dxgi1_2.h>
+#include <dxgi1_4.h>
 #include <pthread.h>
 
 #include "common/common.h"
@@ -291,7 +291,9 @@ bool mp_d3d11_create_swapchain(ID3D11Device *dev, struct mp_log *log,
     IDXGIAdapter1 *adapter = NULL;
     IDXGIFactory1 *factory = NULL;
     IDXGIFactory2 *factory2 = NULL;
+    IDXGIOutput *output = NULL;
     IDXGISwapChain *swapchain = NULL;
+    IDXGISwapChain4 *swapchain3 = NULL;
     bool success = false;
     HRESULT hr;
 
@@ -315,9 +317,40 @@ bool mp_d3d11_create_swapchain(ID3D11Device *dev, struct mp_log *log,
     if (FAILED(hr))
         factory2 = NULL;
 
-    // Try B8G8R8A8_UNORM first, since at least in Windows 8, it's always the
-    // format of the desktop image
-    static const DXGI_FORMAT formats[] = {
+    DXGI_FORMAT desktop_fmt = DXGI_FORMAT_UNKNOWN;
+    hr = IDXGIAdapter_EnumOutputs(adapter, 0, &output);
+    if (SUCCEEDED(hr)) {
+        // Use FindClosestMatchingMode to get the format of the desktop.
+        // According to MSDN, FindClosestMatchingMode "gravitates toward the
+        // values for the desktop" when the target values are unspecified.
+        DXGI_MODE_DESC mode = { 0 };
+        hr = IDXGIOutput_FindClosestMatchingMode(output,
+                                                 &(DXGI_MODE_DESC){ 0 }, &mode,
+                                                 (IUnknown*)dev);
+        if (SUCCEEDED(hr)) {
+            switch (mode.Format) {
+            case DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM:
+                desktop_fmt = DXGI_FORMAT_R10G10B10A2_UNORM;
+                break;
+            case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+                desktop_fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
+                break;
+            case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+                desktop_fmt = DXGI_FORMAT_B8G8R8A8_UNORM;
+                break;
+            case DXGI_FORMAT_R16G16B16A16_FLOAT:
+            case DXGI_FORMAT_R10G10B10A2_UNORM:
+            case DXGI_FORMAT_R8G8B8A8_UNORM:
+            case DXGI_FORMAT_B8G8R8A8_UNORM:
+                desktop_fmt = mode.Format;
+                break;
+            }
+        }
+    }
+
+    DXGI_FORMAT formats[] = {
+        opts->format,
+        desktop_fmt,
         DXGI_FORMAT_B8G8R8A8_UNORM,
         DXGI_FORMAT_R8G8B8A8_UNORM,
     };
@@ -327,6 +360,8 @@ bool mp_d3d11_create_swapchain(ID3D11Device *dev, struct mp_log *log,
     // Return here to retry creating the swapchain
     do {
         for (int i = 0; i < formats_len; i++) {
+            if (formats[i] == DXGI_FORMAT_UNKNOWN)
+                continue;
             if (factory2) {
                 // Create a DXGI 1.2+ (Windows 8+) swap chain if possible
                 hr = create_swapchain_1_2(dev, factory2, log, opts, flip,
@@ -336,8 +371,10 @@ bool mp_d3d11_create_swapchain(ID3D11Device *dev, struct mp_log *log,
                 hr = create_swapchain_1_1(dev, factory, log, opts, formats[i],
                                           &swapchain);
             }
-            if (SUCCEEDED(hr))
+            if (SUCCEEDED(hr)) {
+                mp_verbose(log, "Swapchain format: %u\n", (unsigned)formats[i]);
                 break;
+            }
         }
         if (SUCCEEDED(hr))
             break;
@@ -373,15 +410,22 @@ bool mp_d3d11_create_swapchain(ID3D11Device *dev, struct mp_log *log,
         mp_verbose(log, "Using bitblt-model presentation\n");
     }
 
+    hr = IDXGISwapChain_QueryInterface(swapchain, &IID_IDXGISwapChain3,
+                                       (void**)&swapchain3);
+    if (SUCCEEDED(hr))
+        IDXGISwapChain3_SetColorSpace1(swapchain3, opts->colorspace);
+
     *swapchain_out = swapchain;
     swapchain = NULL;
     success = true;
 
 done:
     SAFE_RELEASE(swapchain);
+    SAFE_RELEASE(swapchain3);
     SAFE_RELEASE(factory2);
     SAFE_RELEASE(factory);
     SAFE_RELEASE(adapter);
+    SAFE_RELEASE(output);
     SAFE_RELEASE(dxgi_dev);
     return success;
 }
