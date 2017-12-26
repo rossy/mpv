@@ -293,7 +293,7 @@ bool mp_d3d11_create_swapchain(ID3D11Device *dev, struct mp_log *log,
     IDXGIFactory2 *factory2 = NULL;
     IDXGIOutput *output = NULL;
     IDXGISwapChain *swapchain = NULL;
-    IDXGISwapChain4 *swapchain3 = NULL;
+    IDXGISwapChain3 *swapchain3 = NULL;
     bool success = false;
     HRESULT hr;
 

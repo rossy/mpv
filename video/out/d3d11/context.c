@@ -32,11 +32,13 @@ struct d3d11_opts {
     int sync_interval;
     int colorspace;
     int format;
+    int excl_fs;
 };
 
 #define OPT_BASE_STRUCT struct d3d11_opts
 const struct m_sub_options d3d11_conf = {
     .opts = (const struct m_option[]) {
+        OPT_FLAG("d3d11-exclusive", excl_fs, 0),
         OPT_CHOICE("d3d11-warp", warp, 0,
                    ({"auto", -1},
                     {"no", 0},
@@ -137,7 +139,7 @@ static bool d3d11_reconfig(struct ra_ctx *ctx)
 
 static int d3d11_color_depth(struct ra_swapchain *sw)
 {
-    struct priv *p = sw->ctx->priv;
+    struct priv *p = sw->priv;
     if (!p->backbuffer)
         return 8;
     if (p->backbuffer->params.format->component_depth[0])
@@ -168,9 +170,45 @@ static void d3d11_swap_buffers(struct ra_swapchain *sw)
     IDXGISwapChain_Present(p->swapchain, p->opts->sync_interval, 0);
 }
 
+static bool set_fullscreen(struct ra_ctx *ctx)
+{
+    struct priv *p = ctx->priv;
+    HRESULT hr;
+
+    hr = IDXGISwapChain_SetFullscreenState(p->swapchain,
+                                           ctx->vo->opts->fullscreen, NULL);
+    if (FAILED(hr))
+        return false;
+
+    if (!resize(ctx))
+        return false;
+
+    if (ctx->vo->opts->fullscreen) {
+        MP_VERBOSE(ctx, "Entered full-screen exclusive mode\n");
+    } else {
+        MP_VERBOSE(ctx, "Left full-screen exclusive mode\n");
+    }
+
+    return true;
+}
+
 static int d3d11_control(struct ra_ctx *ctx, int *events, int request, void *arg)
 {
+    struct priv *p = ctx->priv;
+
+    if (request == VOCTRL_FULLSCREEN && p->swapchain && p->opts->excl_fs &&
+        !ctx->vo->opts->fullscreen)
+    {
+        if (!set_fullscreen(ctx))
+            return VO_FALSE;
+    }
     int ret = vo_w32_control(ctx->vo, events, request, arg);
+    if (request == VOCTRL_FULLSCREEN && p->swapchain && p->opts->excl_fs &&
+        ctx->vo->opts->fullscreen)
+    {
+        if (!set_fullscreen(ctx))
+            return VO_FALSE;
+    }
     if (*events & VO_EVENT_RESIZE) {
         if (!resize(ctx))
             return VO_ERROR;
@@ -181,6 +219,9 @@ static int d3d11_control(struct ra_ctx *ctx, int *events, int request, void *arg
 static void d3d11_uninit(struct ra_ctx *ctx)
 {
     struct priv *p = ctx->priv;
+
+    if (p->swapchain)
+        IDXGISwapChain_SetFullscreenState(p->swapchain, FALSE, NULL);
 
     ra_tex_free(ctx->ra, &p->backbuffer);
     SAFE_RELEASE(p->swapchain);
