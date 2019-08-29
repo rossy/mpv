@@ -17,6 +17,8 @@
 
 #include <windows.h>
 #include <d3d11.h>
+#include <d3d11on12.h>
+#include <d3d12.h>
 #include <dxgi1_2.h>
 #include <pthread.h>
 
@@ -32,6 +34,8 @@
 
 static pthread_once_t d3d11_once = PTHREAD_ONCE_INIT;
 static PFN_D3D11_CREATE_DEVICE pD3D11CreateDevice = NULL;
+static PFN_D3D12_CREATE_DEVICE pD3D12CreateDevice = NULL;
+static PFN_D3D11ON12_CREATE_DEVICE pD3D11On12CreateDevice = NULL;
 static void d3d11_load(void)
 {
     HMODULE d3d11 = LoadLibraryW(L"d3d11.dll");
@@ -39,6 +43,14 @@ static void d3d11_load(void)
         return;
     pD3D11CreateDevice = (PFN_D3D11_CREATE_DEVICE)
         GetProcAddress(d3d11, "D3D11CreateDevice");
+    pD3D11On12CreateDevice = (PFN_D3D11ON12_CREATE_DEVICE)
+        GetProcAddress(d3d11, "D3D11On12CreateDevice");
+
+    HMODULE d3d12 = LoadLibraryW(L"d3d12.dll");
+    if (!d3d12)
+        return;
+    pD3D12CreateDevice = (PFN_D3D12_CREATE_DEVICE)
+        GetProcAddress(d3d12, "D3D12CreateDevice");
 }
 
 // Get a const array of D3D_FEATURE_LEVELs from max_fl to min_fl (inclusive)
@@ -75,18 +87,43 @@ static int get_feature_levels(int max_fl, int min_fl,
 static HRESULT create_device(struct mp_log *log, bool warp, bool debug,
                              int max_fl, int min_fl, ID3D11Device **dev)
 {
+    ID3D12Device *dev12 = NULL;
+    ID3D12CommandQueue *queue = NULL;
+    HRESULT hr;
+
+    hr = pD3D12CreateDevice(NULL, D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device,
+                            (void **)&dev12);
+    if (FAILED(hr))
+        goto done;
+
+    D3D12_COMMAND_QUEUE_DESC queue_desc = {
+        .Flags = D3D12_COMMAND_QUEUE_FLAG_NONE,
+        .Type = D3D12_COMMAND_LIST_TYPE_DIRECT,
+    };
+    hr = ID3D12Device_CreateCommandQueue(dev12, &queue_desc,
+                                         &IID_ID3D12CommandQueue,
+                                         (void **)&queue);
+    if (FAILED(hr))
+        goto done;
+
     const D3D_FEATURE_LEVEL *levels;
     int levels_len = get_feature_levels(max_fl, min_fl, &levels);
     if (!levels_len) {
         mp_fatal(log, "No suitable Direct3D feature level found\n");
-        return E_FAIL;
+        hr = E_FAIL;
+        goto done;
     }
 
-    D3D_DRIVER_TYPE type = warp ? D3D_DRIVER_TYPE_WARP
-                                : D3D_DRIVER_TYPE_HARDWARE;
-    UINT flags = debug ? D3D11_CREATE_DEVICE_DEBUG : 0;
-    return pD3D11CreateDevice(NULL, type, NULL, flags, levels, levels_len,
-        D3D11_SDK_VERSION, dev, NULL, NULL);
+    hr = pD3D11On12CreateDevice((void *)dev12, 0, levels, levels_len,
+                                (IUnknown *const *)&queue, 1, 0, dev, NULL,
+                                NULL);
+
+done:
+    if (dev12)
+        ID3D12Device_Release(dev12);
+    if (queue)
+        ID3D12Device_Release(queue);
+    return hr;
 }
 
 // Create a Direct3D 11 device for rendering and presentation. This is meant to
