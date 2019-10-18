@@ -38,6 +38,10 @@ struct ra_d3d11 {
 
     struct dll_version d3d_compiler_ver;
 
+    // Multi-thread protection
+    ID3D10Multithread *multi;
+    bool locked;
+
     // Debug interfaces (--gpu-debug)
     ID3D11Debug *debug;
     ID3D11InfoQueue *iqueue;
@@ -248,6 +252,22 @@ static void setup_formats(struct ra *ra)
 
         MP_TARRAY_APPEND(ra, ra->formats, ra->num_formats, fmt);
     }
+}
+
+static void dev_lock(struct ra *ra)
+{
+    struct ra_d3d11 *p = ra->priv;
+    if (ID3D10Multithread_GetMultithreadProtected(p->multi)) {
+        ID3D10Multithread_Enter(p->multi);
+        p->locked = true;
+    }
+}
+
+static void dev_unlock(struct ra *ra)
+{
+    struct ra_d3d11 *p = ra->priv;
+    if (p->locked)
+        ID3D10Multithread_Leave(p->multi);
 }
 
 static bool tex_init(struct ra *ra, struct ra_tex *tex)
@@ -690,6 +710,7 @@ static bool tex_download(struct ra *ra, struct ra_tex_download_params *params)
     struct ra_tex *tex = params->tex;
     struct d3d_tex *tex_p = tex->priv;
     HRESULT hr;
+    bool success = false;
 
     if (!tex_p->staging)
         return false;
@@ -697,12 +718,14 @@ static bool tex_download(struct ra *ra, struct ra_tex_download_params *params)
     ID3D11DeviceContext_CopyResource(p->ctx, (ID3D11Resource*)tex_p->staging,
         tex_p->res);
 
+    dev_lock(ra);
+
     D3D11_MAPPED_SUBRESOURCE lock;
     hr = ID3D11DeviceContext_Map(p->ctx, (ID3D11Resource*)tex_p->staging, 0,
                                  D3D11_MAP_READ, 0, &lock);
     if (FAILED(hr)) {
         MP_ERR(ra, "Failed to map staging texture: %s\n", mp_HRESULT_to_str(hr));
-        return false;
+        goto done;
     }
 
     char *cdst = params->dst;
@@ -714,7 +737,11 @@ static bool tex_download(struct ra *ra, struct ra_tex_download_params *params)
 
     ID3D11DeviceContext_Unmap(p->ctx, (ID3D11Resource*)tex_p->staging, 0);
 
-    return true;
+    success = true;
+
+done:
+    dev_unlock(ra);
+    return success;
 }
 
 static void buf_destroy(struct ra *ra, struct ra_buf *buf)
@@ -985,6 +1012,8 @@ static void clear_rpass(struct ra *ra, struct ra_tex *tex, float color[4],
     ID3D11DeviceContext_UpdateSubresource(p->ctx,
         (ID3D11Resource *)p->clear_cbuf, 0, NULL, color, 0, 0);
 
+    dev_lock(ra);
+
     ID3D11DeviceContext_IASetInputLayout(p->ctx, p->clear_layout);
     ID3D11DeviceContext_IASetVertexBuffers(p->ctx, 0, 1, &p->clear_vbuf,
         &(UINT) { sizeof(float[2]) }, &(UINT) { 0 });
@@ -1017,6 +1046,8 @@ static void clear_rpass(struct ra *ra, struct ra_tex *tex, float color[4],
     ID3D11DeviceContext_PSSetConstantBuffers(p->ctx, 0, 1,
         &(ID3D11Buffer *){ NULL });
     ID3D11DeviceContext_OMSetRenderTargets(p->ctx, 0, NULL, NULL);
+
+    dev_unlock(ra);
 }
 
 static void clear(struct ra *ra, struct ra_tex *tex, float color[4],
@@ -1164,6 +1195,8 @@ static void blit_rpass(struct ra *ra, struct ra_tex *dst, struct ra_tex *src,
     ID3D11DeviceContext_UpdateSubresource(p->ctx,
         (ID3D11Resource *)p->blit_vbuf, 0, NULL, verts, 0, 0);
 
+    dev_lock(ra);
+
     ID3D11DeviceContext_IASetInputLayout(p->ctx, p->blit_layout);
     ID3D11DeviceContext_IASetVertexBuffers(p->ctx, 0, 1, &p->blit_vbuf,
         &(UINT) { sizeof(verts[0]) }, &(UINT) { 0 });
@@ -1202,6 +1235,8 @@ static void blit_rpass(struct ra *ra, struct ra_tex *dst, struct ra_tex *src,
     ID3D11DeviceContext_PSSetSamplers(p->ctx, 0, 1,
         &(ID3D11SamplerState *) { NULL });
     ID3D11DeviceContext_OMSetRenderTargets(p->ctx, 0, NULL, NULL);
+
+    dev_unlock(ra);
 }
 
 static void blit(struct ra *ra, struct ra_tex *dst, struct ra_tex *src,
@@ -1445,13 +1480,16 @@ static size_t vbuf_upload(struct ra *ra, void *data, size_t size)
         offset = 0;
     }
 
+    dev_lock(ra);
+
     D3D11_MAPPED_SUBRESOURCE map = { 0 };
     hr = ID3D11DeviceContext_Map(p->ctx, (ID3D11Resource *)p->vbuf, 0,
         discard ? D3D11_MAP_WRITE_DISCARD : D3D11_MAP_WRITE_NO_OVERWRITE,
         0, &map);
     if (FAILED(hr)) {
         MP_ERR(ra, "Failed to map vertex buffer: %s\n", mp_HRESULT_to_str(hr));
-        return -1;
+        offset = -1;
+        goto done;
     }
 
     char *cdata = map.pData;
@@ -1460,6 +1498,9 @@ static size_t vbuf_upload(struct ra *ra, void *data, size_t size)
     ID3D11DeviceContext_Unmap(p->ctx, (ID3D11Resource *)p->vbuf, 0);
 
     p->vbuf_used = offset + size;
+
+done:
+    dev_unlock(ra);
     return offset;
 }
 
@@ -1774,6 +1815,8 @@ static void renderpass_run_raster(struct ra *ra,
     if (vbuf_offset == (UINT)-1)
         return;
 
+    dev_lock(ra);
+
     ID3D11DeviceContext_IASetInputLayout(p->ctx, pass_p->layout);
     ID3D11DeviceContext_IASetVertexBuffers(p->ctx, 0, 1, &p->vbuf,
         &pass->params.vertex_stride, &vbuf_offset);
@@ -1825,6 +1868,8 @@ static void renderpass_run_raster(struct ra *ra,
     ID3D11DeviceContext_PSSetSamplers(p->ctx, 0, samplers_len, samplers);
     ID3D11DeviceContext_OMSetRenderTargetsAndUnorderedAccessViews(p->ctx, 0,
         NULL, NULL, 1, uavs_len, uavs, NULL);
+
+    dev_unlock(ra);
 }
 
 static void renderpass_run_compute(struct ra *ra,
@@ -1839,6 +1884,8 @@ static void renderpass_run_compute(struct ra *ra,
     struct ra_d3d11 *p = ra->priv;
     struct ra_renderpass *pass = params->pass;
     struct d3d_rpass *pass_p = pass->priv;
+
+    dev_lock(ra);
 
     ID3D11DeviceContext_CSSetShader(p->ctx, pass_p->cs, NULL, 0);
     ID3D11DeviceContext_CSSetConstantBuffers(p->ctx, 0, ubos_len, ubos);
@@ -1864,6 +1911,8 @@ static void renderpass_run_compute(struct ra *ra,
     ID3D11DeviceContext_CSSetSamplers(p->ctx, 0, samplers_len, samplers);
     ID3D11DeviceContext_CSSetUnorderedAccessViews(p->ctx, 0, uavs_len, uavs,
                                                   NULL);
+
+    dev_unlock(ra);
 }
 
 static void renderpass_run(struct ra *ra,
@@ -2130,6 +2179,7 @@ static void destroy(struct ra *ra)
     SAFE_RELEASE(p->blit_vbuf);
     SAFE_RELEASE(p->blit_sampler);
     SAFE_RELEASE(p->vbuf);
+    SAFE_RELEASE(p->multi);
     SAFE_RELEASE(p->ctx1);
     SAFE_RELEASE(p->dev1);
     SAFE_RELEASE(p->dev);
@@ -2385,8 +2435,22 @@ struct ra *ra_d3d11_create(ID3D11Device *dev, struct mp_log *log,
         p->max_uavs = D3D11_PS_CS_UAV_REGISTER_COUNT;
     }
 
-    if (ID3D11Device_GetCreationFlags(p->dev) & D3D11_CREATE_DEVICE_DEBUG)
+    UINT creation_flags = ID3D11Device_GetCreationFlags(p->dev);
+
+    if (creation_flags & D3D11_CREATE_DEVICE_DEBUG)
         init_debug_layer(ra);
+
+    if (!(creation_flags & D3D11_CREATE_DEVICE_SINGLETHREADED)) {
+        hr = ID3D11Device_QueryInterface(p->dev, &IID_ID3D10Multithread,
+                                         (void **)&p->multi);
+        if (p->multi) {
+            MP_VERBOSE(ra, "Using multithread protection\n");
+        } else {
+            MP_VERBOSE(ra, "Multithread protection not available\n");
+        }
+    } else {
+        MP_VERBOSE(ra, "Using a single-threaded device\n");
+    }
 
     // Some level 9_x devices don't have timestamp queries
     hr = ID3D11Device_CreateQuery(p->dev,
