@@ -15,6 +15,8 @@
  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <dxgi1_3.h>
+
 #include "common/msg.h"
 #include "options/m_config.h"
 #include "osdep/timer.h"
@@ -93,7 +95,11 @@ struct priv {
     struct ra_tex *backbuffer;
     ID3D11Device *device;
     IDXGISwapChain *swapchain;
+    IDXGISwapChain2 *swapchain2;
     struct mp_colorspace swapchain_csp;
+
+    unsigned sw_width;
+    unsigned sw_height;
 
     int64_t perf_freq;
     unsigned last_sync_refresh_count;
@@ -157,16 +163,33 @@ static bool resize(struct ra_ctx *ctx)
     struct priv *p = ctx->priv;
     HRESULT hr;
 
-    ra_tex_free(ctx->ra, &p->backbuffer);
+    unsigned new_width = MP_ALIGN_UP(ctx->vo->dwidth, 256);
+    unsigned new_height = MP_ALIGN_UP(ctx->vo->dheight, 256);
 
-    hr = IDXGISwapChain_ResizeBuffers(p->swapchain, 0, ctx->vo->dwidth,
-        ctx->vo->dheight, DXGI_FORMAT_UNKNOWN, 0);
-    if (FAILED(hr)) {
-        MP_FATAL(ctx, "Couldn't resize swapchain: %s\n", mp_HRESULT_to_str(hr));
-        return false;
+    if (new_width != p->sw_width || new_height != p->sw_height) {
+        ra_tex_free(ctx->ra, &p->backbuffer);
+
+        MP_INFO(ctx, "Resizing swapchain buffers %u:%u\n", new_width, new_height);
+        hr = IDXGISwapChain_ResizeBuffers(p->swapchain, 0, new_width,
+            new_height, DXGI_FORMAT_UNKNOWN, 0);
+        if (FAILED(hr)) {
+            MP_FATAL(ctx, "Couldn't resize swapchain: %s\n",
+                     mp_HRESULT_to_str(hr));
+            return false;
+        }
+
+        p->sw_width = new_width;
+        p->sw_height = new_height;
+        p->backbuffer = get_backbuffer(ctx);
     }
 
-    p->backbuffer = get_backbuffer(ctx);
+    hr = IDXGISwapChain2_SetSourceSize(p->swapchain2, ctx->vo->dwidth,
+                                       ctx->vo->dheight);
+    if (FAILED(hr)) {
+        MP_FATAL(ctx, "Couldn't resize source image: %s\n",
+                 mp_HRESULT_to_str(hr));
+        return false;
+    }
 
     return true;
 }
@@ -264,6 +287,7 @@ static void d3d11_get_vsync(struct ra_swapchain *sw, struct vo_vsync_info *info)
     if (hr == DXGI_ERROR_FRAME_STATISTICS_DISJOINT) {
         p->last_sync_refresh_count = 0;
         p->last_sync_qpc_time = 0;
+        MP_INFO(sw->ctx, "Frame statistics disjoint\n");
     }
     if (FAILED(hr))
         return;
@@ -336,6 +360,7 @@ static void d3d11_uninit(struct ra_ctx *ctx)
     if (ctx->ra)
         ra_tex_free(ctx->ra, &p->backbuffer);
     SAFE_RELEASE(p->swapchain);
+    SAFE_RELEASE(p->swapchain2);
     vo_w32_uninit(ctx->vo);
     SAFE_RELEASE(p->device);
 
@@ -402,6 +427,9 @@ static bool d3d11_init(struct ra_ctx *ctx)
     };
     if (!mp_d3d11_create_swapchain(p->device, ctx->log, &scopts, &p->swapchain))
         goto error;
+
+    IDXGISwapChain1_QueryInterface(p->swapchain, &IID_IDXGISwapChain2,
+                                   (void **)&p->swapchain2);
 
     p->backbuffer = get_backbuffer(ctx);
     if (!p->backbuffer)
