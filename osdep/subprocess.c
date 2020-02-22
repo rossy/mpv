@@ -29,8 +29,6 @@ void mp_devnull(void *ctx, char *data, size_t size)
 {
 }
 
-#if HAVE_POSIX_SPAWN
-
 int mp_subprocess(char **args, struct mp_cancel *cancel, void *ctx,
                   subprocess_read_cb on_stdout, subprocess_read_cb on_stderr,
                   char **error)
@@ -87,43 +85,6 @@ void mp_subprocess_detached(struct mp_log *log, char **args)
                mp_subprocess_err_str(res.error));
     }
 }
-
-#else
-
-struct subprocess_args {
-    struct mp_log *log;
-    char **args;
-};
-
-static void *run_subprocess(void *ptr)
-{
-    struct subprocess_args *p = ptr;
-    pthread_detach(pthread_self());
-
-    mp_msg_flush_status_line(p->log);
-
-    char *err = NULL;
-    if (mp_subprocess(p->args, NULL, NULL, NULL, NULL, &err) < 0)
-        mp_err(p->log, "Running subprocess failed: %s\n", err);
-
-    talloc_free(p);
-    return NULL;
-}
-
-void mp_subprocess_detached(struct mp_log *log, char **args)
-{
-    struct subprocess_args *p = talloc_zero(NULL, struct subprocess_args);
-    p->log = mp_log_new(p, log, NULL);
-    int num_args = 0;
-    for (int n = 0; args[n]; n++)
-        MP_TARRAY_APPEND(p, p->args, num_args, talloc_strdup(p, args[n]));
-    MP_TARRAY_APPEND(p, p->args, num_args, NULL);
-    pthread_t thread;
-    if (pthread_create(&thread, NULL, run_subprocess, p))
-        talloc_free(p);
-}
-
-#endif
 
 const char *mp_subprocess_err_str(int num)
 {

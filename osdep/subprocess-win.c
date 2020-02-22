@@ -29,6 +29,13 @@
 #include "misc/bstr.h"
 #include "misc/thread_tools.h"
 
+// Internal CRT FD flags
+#define FOPEN   (0x01)
+#define FPIPE   (0x08)
+#define FAPPEND (0x20)
+#define FDEV    (0x40)
+#define FTEXT   (0x80)
+
 static void write_arg(bstr *cmdline, char *arg)
 {
     // Empty args must be represented as an empty quoted string
@@ -88,16 +95,18 @@ static void write_arg(bstr *cmdline, char *arg)
 }
 
 // Convert an array of arguments to a properly escaped command-line string
-static wchar_t *write_cmdline(void *ctx, char **argv)
+static wchar_t *write_cmdline(void *ctx, char *argv0, char **args)
 {
-    // argv[0] should always be quoted. Otherwise, arguments may be interpreted
-    // as part of the program name. Also, it can't contain escape sequences.
+    // argv0 should always be quoted. Otherwise, arguments may be interpreted as
+    // part of the program name. Also, it can't contain escape sequences.
     bstr cmdline = {0};
-    bstr_xappend_asprintf(NULL, &cmdline, "\"%s\"", argv[0]);
+    bstr_xappend_asprintf(NULL, &cmdline, "\"%s\"", argv0);
 
-    for (int i = 1; argv[i]; i++) {
-        bstr_xappend(NULL, &cmdline, bstr0(" "));
-        write_arg(&cmdline, argv[i]);
+    if (args) {
+        for (int i = 0; args[i]; i++) {
+            bstr_xappend(NULL, &cmdline, bstr0(" "));
+            write_arg(&cmdline, args[i]);
+        }
     }
 
     wchar_t *wcmdline = mp_from_utf8(ctx, cmdline.start);
@@ -125,9 +134,13 @@ static int create_overlapped_pipe(HANDLE *read, HANDLE *write)
     if (*read == INVALID_HANDLE_VALUE)
         goto error;
 
+    SECURITY_ATTRIBUTES sa = {
+        .nLength = sizeof sa,
+        .bInheritHandle = TRUE,
+    };
+
     // Open the write end of the pipe as a synchronous handle
-    *write = CreateFileW(buf, GENERIC_WRITE, 0, NULL, OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL, NULL);
+    *write = CreateFileW(buf, GENERIC_WRITE, 0, &sa, OPEN_EXISTING, 0, NULL);
     if (*write == INVALID_HANDLE_VALUE) {
         CloseHandle(*read);
         goto error;
@@ -177,8 +190,8 @@ error:
 static int sparse_wait(HANDLE *handles, unsigned num_handles)
 {
     unsigned w_num_handles = 0;
-    HANDLE w_handles[10];
-    int map[10];
+    HANDLE w_handles[MP_SUBPROCESS_MAX_FDS + 2];
+    int map[MP_SUBPROCESS_MAX_FDS + 2];
     if (num_handles > MP_ARRAY_SIZE(w_handles))
         return -1;
 
@@ -209,62 +222,218 @@ static int async_read(HANDLE file, void *buf, unsigned size, OVERLAPPED* ol)
     return 0;
 }
 
-static void write_none(void *ctx, char *data, size_t size)
+static bool is_valid_handle(HANDLE h)
 {
+    // _get_osfhandle can return -2 "when the file descriptor is not associated
+    // with a stream"
+    return h && h != INVALID_HANDLE_VALUE && (intptr_t)h != -2;
 }
 
-int mp_subprocess(char **args, struct mp_cancel *cancel, void *ctx,
-                  subprocess_read_cb on_stdout, subprocess_read_cb on_stderr,
-                  char **error)
+static wchar_t *convert_environ(void *ctx, char **env)
 {
-    wchar_t *tmp = talloc_new(NULL);
-    int status = -1;
-    struct {
-        HANDLE read;
-        HANDLE write;
-        OVERLAPPED ol;
-        char buf[4096];
-        subprocess_read_cb read_cb;
-    } pipes[2] = {
-        { .read_cb = on_stdout ? on_stdout : write_none },
-        { .read_cb = on_stderr ? on_stderr : write_none },
-    };
+    // Environment size in wchar_ts, including the trailing NUL
+    size_t env_size = 1;
 
-    // If the function exits before CreateProcess, there was an init error
-    *error = "init";
-
-    for (int i = 0; i < 2; i++) {
-        pipes[i].ol.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
-        if (!pipes[i].ol.hEvent)
-            goto done;
-        if (create_overlapped_pipe(&pipes[i].read, &pipes[i].write))
-            goto done;
-        if (!SetHandleInformation(pipes[i].write, HANDLE_FLAG_INHERIT,
-                                                  HANDLE_FLAG_INHERIT))
-            goto done;
+    for (int i = 0; env[i]; i++) {
+        int count = MultiByteToWideChar(CP_UTF8, 0, env[i], -1, NULL, 0);
+        if (count <= 0)
+            abort();
+        env_size += count;
     }
 
-    // Convert the args array to a UTF-16 Windows command-line string
-    wchar_t *cmdline = write_cmdline(tmp, args);
+    wchar_t *ret = talloc_array(ctx, wchar_t, env_size);
+    size_t pos = 0;
 
-    DWORD flags = CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT;
-    PROCESS_INFORMATION pi = {0};
+    for (int i = 0; env[i]; i++) {
+        int count = MultiByteToWideChar(CP_UTF8, 0, env[i], -1,
+                                        ret + pos, env_size - pos);
+        if (count <= 0)
+            abort();
+        pos += count;
+    }
+
+    return ret;
+}
+
+void mp_subprocess2(struct mp_subprocess_opts *opts,
+                    struct mp_subprocess_result *res)
+{
+    wchar_t *tmp = talloc_new(NULL);
+    DWORD r;
+
+    HANDLE share_hndls[MP_SUBPROCESS_MAX_FDS] = {0};
+    int share_hndl_count = 0;
+    HANDLE wait_hndls[MP_SUBPROCESS_MAX_FDS + 2] = {0};
+    int wait_hndl_count = 0;
+
+    struct {
+        HANDLE handle;
+        char crt_flags;
+
+        HANDLE read;
+        OVERLAPPED read_ol;
+        char *read_buf;
+    } fd_data[MP_SUBPROCESS_MAX_FDS] = {0};
+
+    // The maximum FD is limited because FDs have to fit in two sequential
+    // arrays in STARTUPINFO.lpReserved2, which has a maximum size of 65535
+    // bytes. The first four bytes are the handle count, followed by one byte
+    // per handle for flags, and an intptr_t per handle for the HANDLE itself.
+    static const int crt_fd_max = (65535 - sizeof(int)) / (1 + sizeof(intptr_t));
+    int crt_fd_count = 0;
+
+    // If the function exits before CreateProcess, there was an init error
+    *res = (struct mp_subprocess_result){ .error = MP_SUBPROCESS_EINIT };
+
     STARTUPINFOEXW si = {
         .StartupInfo = {
             .cb = sizeof(si),
             .dwFlags = STARTF_USESTDHANDLES | STARTF_FORCEOFFFEEDBACK,
-            .hStdInput = NULL,
-            .hStdOutput = pipes[0].write,
-            .hStdError = pipes[1].write,
         },
-
-        // Specify which handles are inherited by the subprocess. If this isn't
-        // specified, the subprocess inherits all inheritable handles, which
-        // could include handles created by other threads. See:
-        // http://blogs.msdn.com/b/oldnewthing/archive/2011/12/16/10248328.aspx
-        .lpAttributeList = create_handle_list(tmp,
-                (HANDLE[]){ pipes[0].write, pipes[1].write }, 2),
     };
+
+    for (int n = 0; n < opts->num_fds; n++) {
+        if (opts->fds[n].fd >= crt_fd_max) {
+            res->error = MP_SUBPROCESS_EUNSUPPORTED;
+            goto done;
+        }
+
+        if (opts->fds[n].fd >= crt_fd_count)
+            crt_fd_count = opts->fds[n].fd + 1;
+
+        if (opts->fds[n].src_fd >= 0) {
+            HANDLE src_handle;
+            switch (opts->fds[n].src_fd) {
+            case 0:
+                src_handle = GetStdHandle(STD_INPUT_HANDLE);
+                break;
+            case 1:
+                src_handle = GetStdHandle(STD_OUTPUT_HANDLE);
+                break;
+            case 2:
+                src_handle = GetStdHandle(STD_ERROR_HANDLE);
+                break;
+            default:
+                src_handle = (HANDLE)_get_osfhandle(opts->fds[n].src_fd);
+            }
+
+            if (is_valid_handle(src_handle)) {
+                DWORD type;
+                if (GetConsoleMode(src_handle, &(DWORD){0})) {
+                    fd_data[n].crt_flags = FOPEN | FDEV;
+                    fd_data[n].handle = src_handle;
+                } else if ((type = GetFileType(src_handle))) {
+                    switch (type & 0xff) {
+                    case FILE_TYPE_DISK:
+                        fd_data[n].crt_flags = FOPEN;
+                        break;
+                    case FILE_TYPE_CHAR:
+                        fd_data[n].crt_flags = FOPEN | FDEV;
+                        break;
+                    case FILE_TYPE_PIPE:
+                        fd_data[n].crt_flags = FOPEN | FPIPE;
+                        break;
+                    }
+
+                    // Instead of making the source handle inheritable, just
+                    // duplicate it to an inheritable handle
+                    if (!DuplicateHandle(GetCurrentProcess(), src_handle,
+                                         GetCurrentProcess(), &fd_data[n].handle,
+                                         0, TRUE, DUPLICATE_SAME_ACCESS))
+                        goto done;
+                    if (!is_valid_handle(fd_data[n].handle))
+                        goto done;
+
+                    share_hndls[share_hndl_count++] = fd_data[n].handle;
+                }
+            }
+
+        } else if (opts->fds[n].on_read) {
+            fd_data[n].read_ol.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+            if (!is_valid_handle(fd_data[n].read_ol.hEvent))
+                goto done;
+            if (create_overlapped_pipe(&fd_data[n].read, &fd_data[n].handle))
+                goto done;
+
+            wait_hndls[n] = fd_data[n].read_ol.hEvent;
+            wait_hndl_count++;
+
+            fd_data[n].crt_flags = FOPEN | FPIPE;
+            fd_data[n].read_buf = talloc_size(tmp, 4096);
+
+            share_hndls[share_hndl_count++] = fd_data[n].handle;
+
+        } else {
+            DWORD access;
+            if (opts->fds[n].fd == 0) {
+                access = FILE_GENERIC_READ;
+            } else if (opts->fds[n].fd <= 2) {
+                access = FILE_GENERIC_WRITE | FILE_READ_ATTRIBUTES;
+            } else {
+                access = FILE_GENERIC_READ | FILE_GENERIC_WRITE;
+            }
+
+            SECURITY_ATTRIBUTES sa = {
+                .nLength = sizeof sa,
+                .bInheritHandle = TRUE,
+            };
+            fd_data[n].crt_flags = FOPEN | FDEV;
+            fd_data[n].handle = CreateFileW(L"NUL", access,
+                                            FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                            &sa, OPEN_EXISTING, 0, NULL);
+        }
+
+        switch (opts->fds[n].fd) {
+        case 0:
+            si.StartupInfo.hStdInput = fd_data[n].handle;
+            break;
+        case 1:
+            si.StartupInfo.hStdOutput = fd_data[n].handle;
+            break;
+        case 2:
+            si.StartupInfo.hStdError = fd_data[n].handle;
+            break;
+        }
+    }
+
+    wchar_t *exe = mp_from_utf8(tmp, opts->exe);
+
+    // Convert the UTF-8 environment into a UTF-16 Windows environment block
+    wchar_t *env = NULL;
+    if (opts->env)
+        env = convert_environ(tmp, opts->env);
+
+    // Convert the args array to a UTF-16 Windows command-line string
+    char **args = opts->args && opts->args[0] ? &opts->args[1] : 0;
+    wchar_t *cmdline = write_cmdline(tmp, opts->exe, args);
+
+    si.StartupInfo.cbReserved2 = sizeof(int) + crt_fd_count * (1 + sizeof(intptr_t));
+    si.StartupInfo.lpReserved2 = talloc_size(tmp, si.StartupInfo.cbReserved2);
+    char *crt_buf_flags = si.StartupInfo.lpReserved2 + sizeof(int);
+    char *crt_buf_hndls = crt_buf_flags + crt_fd_count;
+
+    memcpy(si.StartupInfo.lpReserved2, &crt_fd_count, sizeof(int));
+
+    // Fill the handle array with INVALID_HANDLE_VALUE, for unassigned handles
+    for (int n = 0; n < crt_fd_count; n++) {
+        HANDLE h = INVALID_HANDLE_VALUE;
+        memcpy(crt_buf_hndls + n * sizeof(intptr_t), &h, sizeof(intptr_t));
+    }
+
+    for (int n = 0; n < opts->num_fds; n++) {
+        crt_buf_flags[opts->fds[n].fd] = fd_data[n].crt_flags;
+        memcpy(crt_buf_hndls + opts->fds[n].fd * sizeof(intptr_t),
+               &fd_data[n].handle, sizeof(intptr_t));
+    }
+
+    DWORD flags = CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT;
+    PROCESS_INFORMATION pi = {0};
+
+    // Specify which handles are inherited by the subprocess. If this isn't
+    // specified, the subprocess inherits all inheritable handles, which could
+    // include handles created by other threads. See:
+    // http://blogs.msdn.com/b/oldnewthing/archive/2011/12/16/10248328.aspx
+    si.lpAttributeList = create_handle_list(tmp, share_hndls, share_hndl_count);
 
     // If we have a console, the subprocess will automatically attach to it so
     // it can receive Ctrl+C events. If we don't have a console, prevent the
@@ -274,87 +443,100 @@ int mp_subprocess(char **args, struct mp_cancel *cancel, void *ctx,
     if (!GetConsoleCP())
         flags |= CREATE_NO_WINDOW;
 
-    if (!CreateProcessW(NULL, cmdline, NULL, NULL, TRUE, flags, NULL, NULL,
+    if (!CreateProcessW(NULL, cmdline, NULL, NULL, TRUE, flags, env, NULL,
                         &si.StartupInfo, &pi))
         goto done;
+    talloc_free(exe);
     talloc_free(cmdline);
+    talloc_free(env);
+    talloc_free(si.StartupInfo.lpReserved2);
     talloc_free(si.lpAttributeList);
     CloseHandle(pi.hThread);
 
-    // Init is finished
-    *error = NULL;
+    res->error = MP_SUBPROCESS_EGENERIC;
 
-    // List of handles to watch with sparse_wait
-    HANDLE handles[] = { pipes[0].ol.hEvent, pipes[1].ol.hEvent, pi.hProcess,
-                         cancel ? mp_cancel_get_event(cancel) : NULL };
+    for (int n = 0; n < opts->num_fds; n++) {
+        if (is_valid_handle(fd_data[n].handle))
+            CloseHandle(fd_data[n].handle);
+        fd_data[n].handle = NULL;
 
-    for (int i = 0; i < 2; i++) {
-        // Close our copy of the write end of the pipes
-        CloseHandle(pipes[i].write);
-        pipes[i].write = NULL;
-
-        // Do the first read operation on each pipe
-        if (async_read(pipes[i].read, pipes[i].buf, 4096, &pipes[i].ol)) {
-            CloseHandle(pipes[i].read);
-            handles[i] = pipes[i].read = NULL;
+        if (fd_data[n].read) {
+            // Do the first read operation on each pipe
+            if (async_read(fd_data[n].read, fd_data[n].read_buf, 4096,
+                           &fd_data[n].read_ol))
+            {
+                CloseHandle(fd_data[n].read);
+                wait_hndls[n] = fd_data[n].read = NULL;
+                wait_hndl_count--;
+            }
         }
     }
 
-    DWORD r;
+    wait_hndls[MP_SUBPROCESS_MAX_FDS] = pi.hProcess;
+    wait_hndl_count++;
+
+    if (opts->cancel)
+        wait_hndls[MP_SUBPROCESS_MAX_FDS + 1] = mp_cancel_get_event(opts->cancel);
+
     DWORD exit_code;
-    while (pipes[0].read || pipes[1].read || pi.hProcess) {
-        int i = sparse_wait(handles, MP_ARRAY_SIZE(handles));
-        switch (i) {
-        case 0:
-        case 1:
+    while (wait_hndl_count) {
+        int n = sparse_wait(wait_hndls, MP_ARRAY_SIZE(wait_hndls));
+
+        if (n >= 0 && n < MP_SUBPROCESS_MAX_FDS) {
             // Complete the read operation on the pipe
-            if (!GetOverlappedResult(pipes[i].read, &pipes[i].ol, &r, TRUE)) {
-                CloseHandle(pipes[i].read);
-                handles[i] = pipes[i].read = NULL;
-                break;
+            if (!GetOverlappedResult(fd_data[n].read, &fd_data[n].read_ol, &r, TRUE)) {
+                CloseHandle(fd_data[n].read);
+                wait_hndls[n] = fd_data[n].read = NULL;
+                wait_hndl_count--;
+            } else {
+                opts->fds[n].on_read(opts->fds[n].on_read_ctx,
+                                     fd_data[n].read_buf, r);
+
+                // Begin the next read operation on the pipe
+                if (async_read(fd_data[n].read, fd_data[n].read_buf, 4096,
+                               &fd_data[n].read_ol))
+                {
+                    CloseHandle(fd_data[n].read);
+                    wait_hndls[n] = fd_data[n].read = NULL;
+                    wait_hndl_count--;
+                }
             }
 
-            pipes[i].read_cb(ctx, pipes[i].buf, r);
-
-            // Begin the next read operation on the pipe
-            if (async_read(pipes[i].read, pipes[i].buf, 4096, &pipes[i].ol)) {
-                CloseHandle(pipes[i].read);
-                handles[i] = pipes[i].read = NULL;
-            }
-
-            break;
-        case 2:
+        } else if (n == MP_SUBPROCESS_MAX_FDS) { // pi.hProcess
             GetExitCodeProcess(pi.hProcess, &exit_code);
-            status = exit_code;
+            res->exit_status = exit_code;
 
             CloseHandle(pi.hProcess);
-            handles[i] = pi.hProcess = NULL;
-            break;
-        case 3:
+            wait_hndls[n] = pi.hProcess = NULL;
+            wait_hndl_count--;
+
+        } else if (n == MP_SUBPROCESS_MAX_FDS + 1) { // opts.cancel
             if (pi.hProcess) {
                 TerminateProcess(pi.hProcess, 1);
-                *error = "killed";
-                status = MP_SUBPROCESS_EKILLED_BY_US;
+                res->error = MP_SUBPROCESS_EKILLED_BY_US;
                 goto done;
             }
-            break;
-        default:
+        } else {
             goto done;
         }
     }
 
+    res->error = MP_SUBPROCESS_OK;
+
 done:
-    for (int i = 0; i < 2; i++) {
-        if (pipes[i].read) {
+    for (int n = 0; n < opts->num_fds; n++) {
+        if (is_valid_handle(fd_data[n].read)) {
             // Cancel any pending I/O (if the process was killed)
-            CancelIo(pipes[i].read);
-            GetOverlappedResult(pipes[i].read, &pipes[i].ol, &r, TRUE);
-            CloseHandle(pipes[i].read);
+            CancelIo(fd_data[n].read);
+            GetOverlappedResult(fd_data[n].read, &fd_data[n].read_ol, &r, TRUE);
+            CloseHandle(fd_data[n].read);
         }
-        if (pipes[i].write) CloseHandle(pipes[i].write);
-        if (pipes[i].ol.hEvent) CloseHandle(pipes[i].ol.hEvent);
+        if (is_valid_handle(fd_data[n].handle))
+            CloseHandle(fd_data[n].handle);
+        if (is_valid_handle(fd_data[n].read_ol.hEvent))
+            CloseHandle(fd_data[n].read_ol.hEvent);
     }
-    if (pi.hProcess) CloseHandle(pi.hProcess);
+    if (pi.hProcess)
+        CloseHandle(pi.hProcess);
     talloc_free(tmp);
-    return status;
 }
