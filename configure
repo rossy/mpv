@@ -109,7 +109,7 @@ check(desc      = "extra clang warnings",
 
 check("-usan",
       desc      = "undefined sanitizer",
-      fn        = lambda: check_cc(flags = "-fsanitize=undefined"))
+      fn        = lambda: check_cc(flags = "-fsanitize=undefined", link = []))
 
 # Reminder: normally always built, but enabled by MPV_LEAK_REPORT.
 # Building it can be disabled only by defining NDEBUG through CFLAGS.
@@ -224,7 +224,7 @@ check("atomics",
 check("librt",
       fn        = lambda: check_cc(link = "-lrt"))
 check("iconv*",
-      fn        = lambda: check_cc(include = "iconv.h",
+      fn        = lambda: check_cc(include = "iconv.h", link = [],
                                    expr = "iconv_open(0, 0);") or
                           check_cc(include = "iconv.h", link = "-liconv",
                                    expr = "iconv_open(0, 0);"),
@@ -250,12 +250,15 @@ check("glob*",
 check("fchmod*",
       fn        = lambda: check_cc(include = "sys/stat.h", expr = "fchmod(0, 0);"))
 check("glibc-thread-name*",
+      deps      = "pthreads",
       fn        = lambda: check_cc(include = "pthread.h",
                     expr = 'pthread_setname_np(pthread_self(), "ducks");'))
 check("osx-thread-name*",
+      deps      = "pthreads",
       fn        = lambda: check_cc(include = "pthread.h",
                     expr = 'pthread_setname_np("ducks");'))
 check("bsd-thread-name*",
+      deps      = "pthreads",
       fn        = lambda: check_cc(include = "pthread.h",
                     expr = 'pthread_set_name_np(pthread_self(), "ducks");'))
 check("bsd-fstatfs*",
@@ -525,6 +528,9 @@ check("-gl-wayland*",
 check("-gl-win32*",
       desc      = "OpenGL Win32 Backend",
       deps      = "win32-desktop",
+      fn        = lambda: check_cc(link = "-lopengl32",
+                                   include = "windows.h",
+                                   expr = "wglCreateContext(0);"),
       sources   = "video/out/opengl/context_win.c")
 check("-gl-dxinterop*",
       desc      = "OpenGL/DirectX Interop Backend",
@@ -628,12 +634,19 @@ check("shaderc*",
       desc      = "libshaderc SPIR-V compiler",
       deps_any  = ["shaderc-shared", "shaderc-static"],
       sources   = "video/out/gpu/spirv_shaderc.c")
-check("-crossc*",
-      desc      = "libcrossc SPIR-V translator",
-      fn        = lambda: check_pkg_config("crossc"))
+check("-spirv-cross-shared",
+      desc      = "SPIRV-Cross SPIR-V shader converter (shared library)",
+      fn        = lambda: check_pkg_config("spirv-cross-c-shared"))
+check("-spirv-cross-static",
+      desc      = "SPIRV-Cross SPIR-V shader converter (static library)",
+      deps_neg  = "spirv-cross-shared",
+      fn        = lambda: check_pkg_config("spirv-cross"))
+check("spirv-cross*",
+      desc      = "SPIRV-Cross SPIR-V shader converter",
+      deps_any  = ["spirv-cross-shared", "spirv-cross-static"])
 check("-d3d11*",
       desc      = "Direct3D 11 video output",
-      deps      = ["win32-desktop", "shaderc", "crossc",],
+      deps      = ["win32-desktop", "shaderc", "spirv-cross",],
       fn        = lambda: check_cc(include = ["d3d11_1.h", "dxgi1_2.h"]),
       sources   = ["video/out/d3d11/context.c",
                    "video/out/d3d11/ra_d3d11.c",
@@ -671,7 +684,6 @@ check("-gl*",
                    "video/out/opengl/context.c",
                    "video/out/opengl/formats.c",
                    "video/out/opengl/libmpv_gl.c",
-                   "video/out/opengl/oml_sync.c",
                    "video/out/opengl/ra_gl.c",
                    "video/out/opengl/utils.c"])
 
@@ -727,9 +739,11 @@ check("-rpi-mmal*",
       sources   = ["video/out/opengl/hwdec_rpi.c",
                    "video/out/vo_rpi.c"])
 
+check(deps_any  = ["gl-x11", "egl-x11"],
+      sources   = ["video/out/opengl/oml_sync.c"])
+
 check(deps      = ["d3d-hwaccel", "egl-angle"],
-      sources   = ["video/out/opengl/hwdec_d3d11egl.c",
-                   "video/out/opengl/hwdec_d3d11eglrgb.c"])
+      sources   = ["video/out/opengl/hwdec_d3d11egl.c"])
 
 check(deps      = ["d3d-hwaccel", "d3d11"],
       sources   = "video/out/d3d11/hwdec_d3d11va.c")
