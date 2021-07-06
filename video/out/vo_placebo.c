@@ -44,6 +44,8 @@
 #include "vulkan/context.h"
 #endif
 
+#include "d3d11/context_libplacebo.h"
+
 struct osd_entry {
     pl_tex tex;
     struct pl_overlay_part *parts;
@@ -430,7 +432,7 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex, const struct pl_source_frame *src
         data[n].row_stride = mpi->stride[n];
         data[n].pixels = mpi->planes[n];
 
-        pl_buf buf = get_dr_buf(mpi);
+        pl_buf buf = (gpu->caps & PL_GPU_CAP_MAPPED_BUFFERS) ? get_dr_buf(mpi) : NULL;
         if (buf) {
             data[n].pixels = NULL;
             data[n].buf = buf;
@@ -839,8 +841,8 @@ static int preinit(struct vo *vo)
     struct gl_video_opts *gl_opts = p->opts_cache->opts;
     struct ra_ctx_opts *ctx_opts = mp_get_config_group(p, vo->global, &ra_ctx_conf);
     struct ra_ctx_opts opts = *ctx_opts;
-    opts.context_type = "vulkan";
-    opts.context_name = NULL;
+    opts.context_type = "d3d11";
+    opts.context_name = "d3d11-libplacebo";
     opts.want_alpha = gl_opts->alpha_mode == 1;
     p->ra_ctx = ra_ctx_create(vo, opts);
     if (!p->ra_ctx)
@@ -855,6 +857,14 @@ static int preinit(struct vo *vo)
         goto done;
     }
 #endif
+
+    struct d3d11_libplacebo_ctx *d3dctx = ra_d3d11_libplacebo_ctx_get(p->ra_ctx);
+    if (d3dctx) {
+        p->pllog = d3dctx->ctx;
+        p->gpu = d3dctx->gpu;
+        p->sw = d3dctx->swapchain;
+        goto done;
+    }
 
     // TODO: wrap GL contexts
 

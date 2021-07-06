@@ -300,6 +300,11 @@ static struct ra_buf *buf_create_pl(struct ra *ra,
         [RA_BUF_TYPE_SHARED_MEMORY]  = 0,
     };
 
+    if (params->host_mapped && !get_gpu(ra)->limits.max_mapped_size)
+        return NULL;
+    if (params->type == RA_BUF_TYPE_TEX_UPLOAD && !get_gpu(ra)->limits.buf_transfer)
+        return NULL;
+
     const struct pl_buf *plbuf = pl_buf_create(get_gpu(ra), &(struct pl_buf_params) {
         .type = buf_type[params->type],
         .size = params->size,
